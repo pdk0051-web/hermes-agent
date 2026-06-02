@@ -4,7 +4,7 @@ import type { DashboardTheme, ThemeTypography, ThemeLayout } from "./types";
  * Built-in dashboard themes.
  *
  * Each theme defines its own palette, typography, and layout so switching
- * themes produces visible changes beyond just color — fonts, density, and
+ * themes produces visible changes beyond just color: fonts, density, and
  * corner-radius all shift to match the theme's personality.
  *
  * Theme names must stay in sync with the backend's
@@ -15,11 +15,14 @@ import type { DashboardTheme, ThemeTypography, ThemeLayout } from "./types";
 // Shared typography / layout presets
 // ---------------------------------------------------------------------------
 
-/** Default system stack — neutral, safe fallback for every platform. */
+/** Default system stack: neutral, safe fallback for every platform. */
 const SYSTEM_SANS =
   'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 const SYSTEM_MONO =
   'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace';
+const VALLEY_SANS =
+  '"Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", ' +
+  'Roboto, "Helvetica Neue", Arial, sans-serif';
 
 const DEFAULT_TYPOGRAPHY: ThemeTypography = {
   fontSans: SYSTEM_SANS,
@@ -38,19 +41,163 @@ const DEFAULT_LAYOUT: ThemeLayout = {
 // Themes
 // ---------------------------------------------------------------------------
 
+const VALLEY_CONSOLE_CSS = `
+.hermes-dashboard-shell[data-theme-name="default"] {
+  background: #fcfcfd;
+  color: #202124;
+  text-transform: none;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar {
+  width: 302px;
+  border-right-color: #e7e7ea;
+  background: rgba(255, 255, 255, 0.96);
+  color: #202124;
+  box-shadow: none;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar > div:first-child {
+  height: 58px;
+  border-bottom-color: #e7e7ea;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar nav {
+  border-top-color: transparent;
+  padding: 14px 12px;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar a {
+  margin: 2px 0;
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-family: var(--theme-font-sans);
+  font-size: 0.92rem;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar a:hover,
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar a[aria-current="page"] {
+  background: #f1f2f3;
+  opacity: 1;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar a[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 999px;
+  background: #58bf67;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar a > span:not([aria-hidden]) {
+  color: #202124;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] [id$="heading"],
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar span[id],
+.hermes-dashboard-shell[data-theme-name="default"] #app-sidebar .font-mondwest {
+  font-family: var(--theme-font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] .blend-lighter {
+  mix-blend-mode: normal;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] h1,
+.hermes-dashboard-shell[data-theme-name="default"] h2,
+.hermes-dashboard-shell[data-theme-name="default"] h3,
+.hermes-dashboard-shell[data-theme-name="default"] .font-expanded,
+.hermes-dashboard-shell[data-theme-name="default"] .font-mondwest,
+.hermes-dashboard-shell[data-theme-name="default"] .font-sans {
+  font-family: var(--theme-font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] .bg-card\\/80,
+.hermes-dashboard-shell[data-theme-name="default"] .bg-card {
+  background-color: #ffffff;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] .border-border {
+  border-color: #e7e7ea;
+}
+
+.hermes-dashboard-shell[data-theme-name="default"] .shadow-\\[0_12px_32px_-8px_rgba\\(0\\,0\\,0\\,0\\.6\\)\\] {
+  box-shadow: 0 8px 20px rgba(17, 24, 39, 0.055);
+}
+`;
+
 export const defaultTheme: DashboardTheme = {
   name: "default",
-  label: "Hermes Teal",
-  description: "Classic dark teal — the canonical Hermes look",
+  label: "Valley Console",
+  description: "Light Valley-inspired operator console",
   palette: {
-    background: { hex: "#041c1c", alpha: 1 },
-    midground: { hex: "#ffe6cb", alpha: 1 },
-    foreground: { hex: "#ffffff", alpha: 0 },
-    warmGlow: "rgba(255, 189, 56, 0.35)",
-    noiseOpacity: 1,
+    background: { hex: "#fcfcfd", alpha: 1 },
+    midground: { hex: "#202124", alpha: 1 },
+    foreground: { hex: "#58bf67", alpha: 1 },
+    warmGlow: "rgba(88, 191, 103, 0.10)",
+    noiseOpacity: 0,
   },
-  typography: DEFAULT_TYPOGRAPHY,
-  layout: DEFAULT_LAYOUT,
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: VALLEY_SANS,
+    baseSize: "14px",
+    lineHeight: "1.5",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "8px",
+  },
+  componentStyles: {
+    backdrop: {
+      baseBlendMode: "normal",
+      baseOpacity: "1",
+      fillerBlendMode: "normal",
+      fillerOpacity: "0",
+      warmOpacity: "0",
+      noiseOpacity: "0",
+    },
+    card: {
+      background: "#ffffff",
+      boxShadow: "0 8px 20px rgba(17, 24, 39, 0.055)",
+    },
+    header: {
+      background: "rgba(255, 255, 255, 0.96)",
+      titleBlendMode: "normal",
+    },
+    sidebar: {
+      background: "rgba(255, 255, 255, 0.96)",
+    },
+  },
+  colorOverrides: {
+    card: "#ffffff",
+    cardForeground: "#202124",
+    popover: "#ffffff",
+    popoverForeground: "#202124",
+    primary: "#2f9c46",
+    primaryForeground: "#ffffff",
+    secondary: "#f7f7f8",
+    secondaryForeground: "#202124",
+    muted: "#f1f2f3",
+    mutedForeground: "#777982",
+    accent: "#f1f2f3",
+    accentForeground: "#202124",
+    destructive: "#d14b48",
+    destructiveForeground: "#ffffff",
+    success: "#58bf67",
+    warning: "#e8ad39",
+    border: "#e7e7ea",
+    input: "#d4d4d8",
+    ring: "#58bf67",
+  },
+  customCSS: VALLEY_CONSOLE_CSS,
   terminalBackground: "#000000",
 };
 
@@ -187,22 +334,27 @@ export const roseTheme: DashboardTheme = {
 /**
  * Same look as ``defaultTheme`` but with a larger root font size, looser
  * line-height, and ``spacious`` density so every rem-based size in the
- * dashboard scales up. For users who find the default 15px UI too dense.
+ * dashboard scales up. For users who find the default 14px UI too dense.
  */
 export const defaultLargeTheme: DashboardTheme = {
   name: "default-large",
-  label: "Hermes Teal (Large)",
-  description: "Hermes Teal with bigger fonts and roomier spacing",
+  label: "Valley Console (Large)",
+  description: "Valley Console with bigger fonts and roomier spacing",
   palette: defaultTheme.palette,
   typography: {
-    ...DEFAULT_TYPOGRAPHY,
+    ...defaultTheme.typography,
     baseSize: "18px",
     lineHeight: "1.65",
   },
   layout: {
     ...DEFAULT_LAYOUT,
+    radius: "8px",
     density: "spacious",
   },
+  componentStyles: defaultTheme.componentStyles,
+  colorOverrides: defaultTheme.colorOverrides,
+  customCSS: defaultTheme.customCSS,
+  terminalBackground: defaultTheme.terminalBackground,
 };
 
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {

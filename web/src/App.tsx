@@ -469,7 +469,8 @@ export default function App() {
   return (
     <div
       data-layout-variant={layoutVariant}
-      className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black text-text-primary antialiased"
+      data-theme-name={theme.name}
+      className="hermes-dashboard-shell flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-midground antialiased"
     >
       <SelectionSwitcher />
       <Backdrop />
@@ -502,7 +503,10 @@ export default function App() {
 
         <Typography
           className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground"
-          style={{ mixBlendMode: "plus-lighter" }}
+          style={{
+            mixBlendMode:
+              "var(--component-header-title-blend-mode, plus-lighter)" as React.CSSProperties["mixBlendMode"],
+          }}
         >
           {t.app.brand}
         </Typography>
@@ -559,8 +563,11 @@ export default function App() {
                 <PluginSlot name="header-left" />
 
                 <Typography
-                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase"
-                  style={{ mixBlendMode: "plus-lighter" }}
+                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
+                  style={{
+                    mixBlendMode:
+                      "var(--component-header-title-blend-mode, plus-lighter)" as React.CSSProperties["mixBlendMode"],
+                  }}
                 >
                   Hermes
                   <br />
