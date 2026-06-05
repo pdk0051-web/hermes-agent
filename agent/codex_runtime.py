@@ -254,7 +254,21 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        # Codex turn budget: the library default (600s / 10 min) guillotines any
+        # production work longer than ten minutes — turns were coming back as
+        # 52-char stubs after "turn timed out after 600.0s". Let a turn run up to
+        # the gateway's overall message budget (agent.gateway_timeout, exported
+        # as HERMES_AGENT_TIMEOUT; default 1800s), minus a small margin so the
+        # codex-side timeout returns partial work gracefully BEFORE the gateway
+        # hard-cuts the message.
+        try:
+            _gw_to = float(os.environ.get("HERMES_AGENT_TIMEOUT") or 1800.0)
+        except (TypeError, ValueError):
+            _gw_to = 1800.0
+        _codex_turn_timeout = max(600.0, _gw_to - 30.0)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message, turn_timeout=_codex_turn_timeout
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
