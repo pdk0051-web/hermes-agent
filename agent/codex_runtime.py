@@ -208,6 +208,33 @@ def run_codex_app_server_turn(
                 if cb is None or note.get("method") != "item/started":
                     return
                 item = (note.get("params") or {}).get("item") or {}
+                # LEOS_STATE marker — an EXPLICIT, race-free state transition the
+                # agent emits as a no-op shell command (`: LEOS_STATE <emoji>
+                # <label> [:: <detail>]`). The `:` POSIX no-op carries the state
+                # INTO codex's commandExecution stream (which this bridge already
+                # sees), so the state IS the command — nothing for us to read
+                # mid-write. Handled BEFORE the step-count bump / classification,
+                # only for commandExecution items. A marker is a signal, not work:
+                # it does NOT bump _codex_step_count, and it emits IMMEDIATELY
+                # (bypassing the 30s generic throttle) while still deduping vs the
+                # current phase. NB: `_codex_phase` here is the agent ATTRIBUTE
+                # (the last emitted state), NOT the nested `_codex_phase(item)`
+                # classifier function above.
+                if (item.get("type") or "") == "commandExecution":
+                    import re as _re
+                    _marker_cmd = _dewrap_codex_command(item.get("command"))
+                    _m = _re.match(r"^:?\s*LEOS_STATE\s+(.+)$", _marker_cmd, _re.DOTALL)
+                    if _m:
+                        _cap = _m.group(1)
+                        _label_part, _sep, _detail = _cap.partition("::")
+                        label = _label_part.strip()
+                        detail = _detail.strip()
+                        if label and label != getattr(agent, "_codex_phase", None):
+                            now = time.time()
+                            agent._codex_phase = label
+                            agent._codex_last_emit_ts = now
+                            cb("tool.started", tool_name=label, preview=detail)
+                        return
                 phase = _codex_phase(item)
                 if phase is None:
                     return

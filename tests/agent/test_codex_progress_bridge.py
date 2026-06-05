@@ -377,3 +377,128 @@ def test_progress_bridge_is_fail_open(monkeypatch):
 
     # Must swallow the error — a display failure may never break a codex turn.
     _emit(on_event, {"type": "commandExecution", "command": "git status"})
+
+
+# ---------------------------------------------------------------------------
+# LEOS_STATE marker — explicit, race-free production/contract state transitions.
+#
+# The agent emits each state transition as a no-op shell command
+# `: LEOS_STATE <emoji> <label> [:: <detail>]`. The `:` POSIX no-op carries the
+# state INTO codex's commandExecution stream (which the bridge already sees), so
+# the state IS the command — race-free, no file to read mid-write. A marker is a
+# signal, not work: it emits IMMEDIATELY (bypassing the 30s generic throttle),
+# dedups vs the current phase, and does NOT bump the step counter.
+# ---------------------------------------------------------------------------
+
+
+def test_leos_state_marker_emits_label_no_detail(monkeypatch):
+    """`: LEOS_STATE 📝 계약 인터뷰` → exactly one emit, tool_name is the label,
+    preview is empty, and the step counter does NOT advance (a marker is a
+    signal, not a step)."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {"type": "commandExecution", "command": ": LEOS_STATE 📝 계약 인터뷰"})
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "tool.started"
+    assert kwargs.get("tool_name") == "📝 계약 인터뷰"
+    assert kwargs.get("preview") == ""
+    # A marker is not real work — the step counter must stay at 0.
+    assert agent._codex_step_count == 0
+
+
+def test_leos_state_marker_with_detail(monkeypatch):
+    """`: LEOS_STATE 🏗️ 생산 중 :: dashboard API` → label left of `::`,
+    detail right of it."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {
+        "type": "commandExecution",
+        "command": ": LEOS_STATE 🏗️ 생산 중 :: dashboard API",
+    })
+
+    assert len(calls) == 1
+    kwargs = calls[0][1]
+    assert kwargs.get("tool_name") == "🏗️ 생산 중"
+    assert kwargs.get("preview") == "dashboard API"
+    assert agent._codex_step_count == 0
+
+
+def test_leos_state_marker_bypasses_generic_throttle(monkeypatch):
+    """A LEOS_STATE marker for a NEW state emits IMMEDIATELY even when the 30s
+    generic throttle would otherwise suppress it: seed _codex_last_emit_ts to
+    'now' and _codex_phase to a generic label, then the marker still emits.
+    Contrast: a generic dev phase change under the same clock is throttled."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(codex_runtime.time, "time", lambda: clock["t"])
+
+    # Seed: a generic phase just emitted at t=1000 (throttle armed, 0s elapsed).
+    agent._codex_phase = "코드 살펴보는 중"
+    agent._codex_last_emit_ts = 1000.0
+
+    # Contrast — a generic dev phase change 0s later is THROTTLED (no emit).
+    _emit(on_event, {"type": "fileChange", "path": "/tmp/a.py"})
+    assert len(calls) == 0, "generic phase change within 30s must be throttled"
+
+    # The LEOS_STATE marker for a NEW state STILL emits immediately.
+    _emit(on_event, {"type": "commandExecution", "command": ": LEOS_STATE 🎯 계약 이행"})
+    assert len(calls) == 1
+    assert calls[0][1].get("tool_name") == "🎯 계약 이행"
+
+
+def test_leos_state_marker_dedups_same_state(monkeypatch):
+    """The same marker twice → only one emit (dedup vs the current phase)."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {"type": "commandExecution", "command": ": LEOS_STATE ⏳ 계약 미충족"})
+    _emit(on_event, {"type": "commandExecution", "command": ": LEOS_STATE ⏳ 계약 미충족"})
+
+    assert len(calls) == 1
+    assert calls[0][1].get("tool_name") == "⏳ 계약 미충족"
+
+
+def test_leos_state_marker_wrapped_in_login_shell(monkeypatch):
+    """The wrapped form `/bin/zsh -lc ": LEOS_STATE ✅ 계약 성립"` is dewrapped,
+    then detected."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {
+        "type": "commandExecution",
+        "command": "/bin/zsh -lc \": LEOS_STATE ✅ 계약 성립\"",
+    })
+
+    assert len(calls) == 1
+    assert calls[0][1].get("tool_name") == "✅ 계약 성립"
+    assert calls[0][1].get("preview") == ""
+    assert agent._codex_step_count == 0
+
+
+def test_normal_command_still_classifies_and_bumps_counter(monkeypatch):
+    """Regression: a normal command (not a marker) still classifies as a phase
+    AND bumps the step counter. The marker fast-path must not swallow real
+    commands."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {"type": "commandExecution", "command": "rg -n foo /tmp"})
+
+    assert len(calls) == 1
+    kwargs = calls[0][1]
+    assert "코드 살펴보는 중" in kwargs.get("tool_name", "")
+    assert kwargs.get("preview") == "1단계째"
+    # A real command IS work — the counter advances.
+    assert agent._codex_step_count == 1
