@@ -243,6 +243,37 @@ class TestWebServerEndpoints:
         assert "hermes_home" in data
         assert "active_sessions" in data
 
+    def test_get_agent_os_status(self, monkeypatch, tmp_path):
+        import hermes_cli.agent_os_status as agent_os_status
+
+        root = tmp_path / "LEOS"
+        (root / "constitution").mkdir(parents=True)
+        (root / "constitution" / "constitution.md").write_text(
+            "constitution\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LEOS_ROOT", str(root))
+        monkeypatch.setattr(agent_os_status, "_list_skill_records", lambda: [])
+        monkeypatch.setattr(agent_os_status, "_disabled_skill_names", lambda: set())
+        monkeypatch.setattr(
+            agent_os_status,
+            "_runtime_status",
+            lambda: {
+                "api_mode": "codex_app_server",
+                "memory_provider": "leos_knowledge",
+                "tool_progress_bridge": "available",
+            },
+        )
+
+        resp = self.client.get("/api/agent-os/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["agent_os"] == "leos"
+        assert data["detected"] is True
+        assert data["constitution"]["exists"] is True
+        assert "PRIVATE" not in repr(data)
+
     def test_get_sessions_uses_only_persisted_cwd(self, monkeypatch):
         """Session rows without persisted cwd must not inherit TERMINAL_CWD.
 

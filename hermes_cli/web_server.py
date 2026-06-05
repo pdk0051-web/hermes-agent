@@ -840,6 +840,13 @@ async def get_status():
     }
 
 
+@app.get("/api/agent-os/status")
+async def get_agent_os_status():
+    from hermes_cli.agent_os_status import build_agent_os_status
+
+    return build_agent_os_status()
+
+
 @app.get("/api/system/stats")
 async def get_system_stats():
     """Host + process system stats for the System page.
