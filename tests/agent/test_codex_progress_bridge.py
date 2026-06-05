@@ -34,6 +34,9 @@ def _make_agent(recorder):
     # even if that reset is ever skipped.
     agent._codex_phase = None
     agent._codex_step_count = 0
+    # Generic-dev throttle clock (Problem 2). Seed to 0.0 so the first generic
+    # emit always clears the >=30s gate; LEOS phases bypass it entirely.
+    agent._codex_last_emit_ts = 0.0
     # Attributes the post-turn bookkeeping reads.
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -94,16 +97,19 @@ def test_codex_runtime_wires_progress_on_event(monkeypatch):
 
 
 def test_turn_start_resets_phase_and_step_count(monkeypatch):
-    """The per-turn reset zeroes the step counter and clears the phase."""
+    """The per-turn reset zeroes the step counter, clears the phase, and resets
+    the generic-dev throttle clock."""
     agent = _make_agent(lambda *a, **k: None)
     # Dirty the state as if a previous turn ran.
     agent._codex_phase = "계약 작업"
     agent._codex_step_count = 17
+    agent._codex_last_emit_ts = 123456.0
 
     _run_turn_and_capture_on_event(monkeypatch, agent)
 
     assert agent._codex_phase is None
     assert agent._codex_step_count == 0
+    assert agent._codex_last_emit_ts == 0.0
 
 
 @pytest.mark.parametrize(
@@ -193,6 +199,114 @@ def test_gateway_path_is_not_misread_as_governance(monkeypatch):
     assert "코드 살펴보는 중" in name
 
 
+def test_non_leos_governance_skill_is_generic_dev(monkeypatch):
+    """Problem 1: a skill literally named `agent-os-governance` contains
+    'govern' but is NOT LEOS (no /leos/ path, no leos-* marker). Editing it
+    must read as 코드 고치는 중, never 통치·게이트."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {
+        "type": "fileChange",
+        "path": "/Users/leo/.hermes/skills/agent-os-governance/SKILL.md",
+    })
+
+    assert len(calls) == 1
+    name = calls[0][1].get("tool_name", "")
+    assert "통치·게이트" not in name
+    assert "코드 고치는 중" in name
+
+
+def test_non_leos_governance_dir_command_is_generic(monkeypatch):
+    """Problem 1: a command touching a generic 'governance' dir (no /leos/)
+    must read as 코드 살펴보는 중, not a LEOS label."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {"type": "commandExecution", "command": "rg -n foo /some/governance/dir"})
+
+    assert len(calls) == 1
+    name = calls[0][1].get("tool_name", "")
+    assert "통치·게이트" not in name
+    assert "코드 살펴보는 중" in name
+
+
+def test_real_leos_paths_still_classify(monkeypatch):
+    """Problem 1: with real /leos/ context present, sub-classification still
+    produces the right domain labels."""
+    cases = [
+        ({"type": "fileChange", "path": "/Users/leo/LEOS/ops/governance/gate.md"}, "통치·게이트"),
+        ({"type": "fileChange", "path": "/Users/leo/LEOS/ops/contracts/x.md"}, "계약 작업"),
+        ({"type": "fileChange", "path": "/Users/leo/LEOS/statutes/article-0.md"}, "법·헌법 확인"),
+        ({"type": "fileChange", "path": "/Users/leo/LEOS/ledger/2026.md"}, "원장 기록"),
+    ]
+    for item, expected in cases:
+        calls = []
+        agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+        on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+        _emit(on_event, item)
+        assert len(calls) == 1, expected
+        assert expected in calls[0][1].get("tool_name", ""), expected
+
+
+def test_generic_dev_phases_are_throttled(monkeypatch):
+    """Problem 2: generic dev phase changes are throttled to one line per ~30s.
+    A phase change within the window is suppressed; another past the window
+    emits. LEOS phases are unaffected (covered separately)."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    # Controllable clock. last_emit_ts is seeded to 0.0 by _make_agent, so the
+    # first emit clears the gate (1000 - 0.0 >= 30); subsequent emits throttle
+    # against the LAST EMIT time, not wall clock.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(codex_runtime.time, "time", lambda: clock["t"])
+
+    # First generic phase (reader) → emits, arms throttle at t=1000.
+    _emit(on_event, {"type": "commandExecution", "command": "/bin/zsh -lc \"sed -n '1,5p' /tmp/a.py\""})
+    assert len(calls) == 1
+    assert "코드 살펴보는 중" in calls[0][1].get("tool_name", "")
+
+    # +5s — switch to a DIFFERENT generic phase (file edit) inside the 30s
+    # window → SUPPRESSED (no new emit), and _codex_phase must NOT advance.
+    clock["t"] = 1005.0
+    _emit(on_event, {"type": "fileChange", "path": "/tmp/a.py"})
+    assert len(calls) == 1, "generic phase shift within 30s must be throttled"
+    assert agent._codex_phase == "코드 살펴보는 중", "suppressed shift must keep last EMITTED phase"
+
+    # +35s from the last EMIT — a generic shift to a DIFFERENT phase (file edit)
+    # past the window → emits. (It must differ from the last EMITTED phase
+    # "코드 살펴보는 중", which the suppressed shift left in place.)
+    clock["t"] = 1035.0
+    _emit(on_event, {"type": "fileChange", "path": "/tmp/a.py"})
+    assert len(calls) == 2
+    assert "코드 고치는 중" in calls[1][1].get("tool_name", "")
+
+
+def test_leos_phase_bypasses_throttle(monkeypatch):
+    """Problem 2: a LEOS milestone emits immediately even inside the 30s
+    generic-throttle window."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(codex_runtime.time, "time", lambda: clock["t"])
+
+    # t=1000 — a generic reader emits and arms the throttle.
+    _emit(on_event, {"type": "commandExecution", "command": "/bin/zsh -lc \"sed -n '1,5p' /tmp/a.py\""})
+    assert len(calls) == 1
+
+    # t=1005 — a LEOS phase change only 5s later (inside the window) STILL emits.
+    clock["t"] = 1005.0
+    _emit(on_event, {"type": "fileChange", "path": "/Users/leo/LEOS/ops/contracts/x.md"})
+    assert len(calls) == 2
+    assert "계약 작업" in calls[1][1].get("tool_name", "")
+
+
 def test_same_phase_collapses_to_single_emit(monkeypatch):
     """Two consecutive same-phase items emit once; a third, different phase
     emits a second time (meaningful-unit collapsing)."""
@@ -200,13 +314,21 @@ def test_same_phase_collapses_to_single_emit(monkeypatch):
     agent = _make_agent(lambda *a, **k: calls.append((a, k)))
     on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
 
+    # Drive the throttle clock so generic-phase SHIFTS are past the 30s gate
+    # (collapsing, not throttling, is what's under test here). Start past the
+    # gate so the first emit clears it against the 0.0 seed.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(codex_runtime.time, "time", lambda: clock["t"])
+
     # Two readers in a row → both "코드 살펴보는 중" → ONE emit.
     _emit(on_event, {"type": "commandExecution", "command": "/bin/zsh -lc \"sed -n '1,5p' /tmp/a.py\""})
     _emit(on_event, {"type": "commandExecution", "command": "rg -n bar /tmp"})
     assert len(calls) == 1
     assert "코드 살펴보는 중" in calls[0][1].get("tool_name", "")
 
-    # A third item of a DIFFERENT phase (a file edit) → second emit.
+    # A third item of a DIFFERENT phase (a file edit), well past the throttle
+    # window → second emit.
+    clock["t"] = 1100.0
     _emit(on_event, {"type": "fileChange", "path": "/tmp/a.py"})
     assert len(calls) == 2
     assert "코드 고치는 중" in calls[1][1].get("tool_name", "")

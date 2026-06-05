@@ -3512,9 +3512,13 @@ class GatewayRunner:
                 # Hermes call), so "iteration 0/60" is noise. When the codex
                 # progress bridge has counted real per-tool steps, show those
                 # instead; otherwise fall back to the iteration heartbeat.
-                _codex_steps = getattr(running_agent, "_codex_step_count", 0) or 0
-                if _codex_steps:
-                    status_parts.append(f"{_codex_steps} steps")
+                # Detect the codex runtime by attribute PRESENCE, not a truthy
+                # step count — at step 0 the count is falsy but "iteration 0/60"
+                # is still meaningless on this path, so show "0 steps" instead.
+                if hasattr(running_agent, "_codex_step_count"):
+                    status_parts.append(
+                        f"{getattr(running_agent, '_codex_step_count', 0) or 0} steps"
+                    )
                 elif max_iter:
                     status_parts.append(f"iteration {iteration}/{max_iter}")
                 if current_tool:

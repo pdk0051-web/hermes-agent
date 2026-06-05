@@ -49,6 +49,7 @@ def run_codex_app_server_turn(
     try:
         agent._codex_phase = None
         agent._codex_step_count = 0
+        agent._codex_last_emit_ts = 0.0
     except Exception:
         pass
 
@@ -105,36 +106,56 @@ def run_codex_app_server_turn(
         _SEARCH = {"rg", "grep", "egrep", "fgrep", "ag", "ack"}
         _LIST = {"ls", "find", "fd", "tree", "exa", "eza", "stat", "du"}
 
+        # LEOS milestone labels bypass the generic-dev throttle (always emit).
+        _LEOS_LABELS = {
+            "법·헌법 확인", "계약 작업", "원장 기록", "통치·게이트",
+            "조약", "감사·검토", "LEOS 작업",
+        }
+
         def _leos_phase(blob):
             # LEOS-domain classification from any path / command / skill / mcp
             # text on the item. Checked FIRST so domain work reads as itself.
-            # Case-insensitive substring match; returns (emoji, label) or None.
+            #
+            # ROOT FIX: only classify as LEOS when the blob is actually in LEOS
+            # CONTEXT (a /leos/ path, a leos-* skill, or the Korean domain words
+            # 헌법/계약), THEN sub-classify. Generic "governance"/"gate"/"review"/
+            # "contract" tokens NO LONGER trigger LEOS labels on their own — that
+            # false-matched things like an `agent-os-governance` skill ("govern")
+            # or `gateway/*.py` reads. Returns (emoji, label) or None.
             t = (blob or "").lower()
             if not t:
                 return None
+            is_leos = (
+                "/leos/" in t
+                or "/users/leo/leos" in t
+                or "leos-constitution" in t
+                or "leos-contract" in t
+                or "leos-governor" in t
+                or "헌법" in (blob or "")
+                or "계약" in (blob or "")
+            )
+            if not is_leos:
+                # Not real LEOS context — let the generic dev classifier handle
+                # it. This is the key change.
+                return None
+            # LEOS context confirmed — sub-classify by keyword (now safe).
             if (any(k in t for k in (
                     "statutes", "bylaws", "decrees", "article-0", "constitution"))
                     or "헌법" in (blob or "")
                     or "leos-constitution" in t):
                 return ("⚖️", "법·헌법 확인")
-            if ("ops/contracts" in t or "/contract" in t
+            if ("contracts" in t or "contract" in t
                     or "계약" in (blob or "") or "leos-contract" in t):
                 return ("📜", "계약 작업")
-            if "/ledger" in t:
+            if "ledger" in t:
                 return ("📒", "원장 기록")
-            # NOTE: match "gate" only as a path segment — bare "gate" would
-            # false-match "gateway" (ordinary gateway/*.py reads), "delegate",
-            # "investigate", etc. "govern" covers governance/governor (LEOS).
-            if ("ops/governance" in t or "govern" in t
-                    or "/gate/" in t or "/gates/" in t):
+            if "governance" in t or "govern" in t or "gate" in t:
                 return ("🏛️", "통치·게이트")
-            if "/treaties" in t:
+            if "treaties" in t:
                 return ("🤝", "조약")
-            if "/reviews" in t:
+            if "reviews" in t:
                 return ("🔎", "감사·검토")
-            if "/users/leo/leos" in t or "/leos/" in t:
-                return ("🏛️", "LEOS 작업")
-            return None
+            return ("🏛️", "LEOS 작업")
 
         def _codex_phase(item):
             # Map a codex item → (emoji, label). LEOS domain wins; otherwise a
@@ -191,17 +212,34 @@ def run_codex_app_server_turn(
                 if phase is None:
                     return
                 # Step counter advances on EVERY recognized item, even when the
-                # phase is unchanged and no line is emitted.
+                # phase is unchanged / suppressed and no line is emitted.
                 agent._codex_step_count = getattr(agent, "_codex_step_count", 0) + 1
                 emoji, label = phase
                 # Meaningful unit: emit only when the activity SHIFTS.
-                if label != getattr(agent, "_codex_phase", None):
+                changed = label != getattr(agent, "_codex_phase", None)
+                if not changed:
+                    return
+                # Throttle generic dev phases to one line per ~30s (real work
+                # alternates 탐색↔명령↔테스트 fast → a wall of lines). LEOS
+                # milestones bypass the throttle and always show.
+                now = time.time()
+                is_leos = label in _LEOS_LABELS
+                if is_leos:
+                    emit = True
+                else:
+                    emit = (now - getattr(agent, "_codex_last_emit_ts", 0.0)) >= 30.0
+                if emit:
+                    # Only advance the compared-against phase on an actual emit,
+                    # so a suppressed shift keeps comparing to the last EMITTED
+                    # phase (not the suppressed one).
                     agent._codex_phase = label
+                    agent._codex_last_emit_ts = now
                     cb(
                         "tool.started",
                         tool_name=f"{emoji} {label}",
                         preview=f"{agent._codex_step_count}단계째",
                     )
+                # else: suppressed — do NOT update _codex_phase.
             except Exception:
                 pass
 
