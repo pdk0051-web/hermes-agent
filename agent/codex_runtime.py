@@ -339,6 +339,22 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
+    # Durable work-journal write side (Phase 1). Externalise a LEAN record
+    # of this turn's meaning into an append-only journal so later phases can
+    # trim the transcript without losing what happened. Additive + fail-open:
+    # a journal failure must NEVER break the turn (mirrors the external
+    # memory sync guard below).
+    try:
+        from agent import work_journal
+
+        work_journal.record_turn(
+            turn,
+            session_id=str(effective_task_id),
+            turn_index=getattr(agent, "_codex_turn_index", None),
+        )
+    except Exception:
+        pass
+
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
     # in the run_conversation() pre-loop block (lines ~11793-11817) so we
