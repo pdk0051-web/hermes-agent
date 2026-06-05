@@ -251,6 +251,8 @@ export async function buildWsUrl(
 
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  getAgentOsStatus: () =>
+    fetchJSON<AgentOsStatusResponse>("/api/agent-os/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -1277,6 +1279,48 @@ export interface StatusResponse {
   latest_config_version: number;
   release_date: string;
   version: string;
+}
+
+export interface AgentOsFileStatus {
+  path: string;
+  exists: boolean;
+  sha256: string | null;
+  mtime: string | null;
+}
+
+export interface AgentOsContractStatus extends AgentOsFileStatus {
+  id: string;
+  status: string;
+}
+
+export interface AgentOsSkillStatus {
+  name: string;
+  installed: boolean;
+  enabled: boolean;
+  source: string;
+}
+
+export interface AgentOsRuntimeStatus {
+  api_mode: string;
+  memory_provider: string;
+  tool_progress_bridge: string;
+}
+
+export interface AgentOsValidationStatus {
+  last_checked_at: string;
+  evidence: string[];
+}
+
+export interface AgentOsStatusResponse {
+  agent_os: "leos";
+  detected: boolean;
+  root: string;
+  constitution: AgentOsFileStatus;
+  contracts: AgentOsContractStatus[];
+  skills: AgentOsSkillStatus[];
+  runtime: AgentOsRuntimeStatus;
+  validation: AgentOsValidationStatus;
+  warnings: string[];
 }
 
 export interface SessionInfo {
