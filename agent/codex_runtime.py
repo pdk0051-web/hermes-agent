@@ -43,6 +43,15 @@ def run_codex_app_server_turn(
     """
     from agent.transports.codex_app_server_session import CodexAppServerSession
 
+    # Per-turn progress state for the meaningful-unit bridge below. Reset at
+    # the very start of every turn (before the session runs) so the phase
+    # collapsing and step counter start fresh each message. Fail-open.
+    try:
+        agent._codex_phase = None
+        agent._codex_step_count = 0
+    except Exception:
+        pass
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -58,19 +67,29 @@ def run_codex_app_server_turn(
             approval_callback = None
         # LEOS: surface codex's INTERNAL tool activity (exec / file edits / mcp)
         # as Hermes tool-progress bubbles. The codex_app_server runtime runs
-        # tools INSIDE codex, so without this the live "skill/terminal" trace
-        # that the chat_completions path shows is invisible in Slack (every turn
-        # looked like api_calls=1 with no progress). Reads the per-turn
-        # agent.tool_progress_callback dynamically (reassigned each message) and
-        # fires on item/started for a live trace. Fully fail-open — a display
-        # error never breaks the codex turn (caller also wraps on_event).
-        def _humanize_codex_command(raw):
+        # tools INSIDE codex, so without this the live trace that the
+        # chat_completions path shows is invisible in Slack (every turn looked
+        # like api_calls=1 with no progress).
+        #
+        # Rather than echoing EVERY raw codex tool (read_file/terminal/search —
+        # too granular/noisy for a non-technical PM), we collapse runs of
+        # similar activity into a single MEANINGFUL UNIT: each item is mapped
+        # to a (emoji, label) "phase" — LEOS domain first (법·헌법 확인 / 계약
+        # 작업 / 원장 기록 / 통치·게이트 …), else a generic dev phase (코드
+        # 살펴보는 중 / 테스트 / 빌드 …) — and a line is emitted ONLY when the
+        # phase CHANGES. A per-turn step counter (agent._codex_step_count)
+        # increments on every item and rides along as the preview ("N단계째"),
+        # giving a real progress signal (the heartbeat's "iteration N/60" is
+        # meaningless here — it counts Hermes API calls, which stay 0).
+        #
+        # Reads the per-turn agent.tool_progress_callback dynamically
+        # (reassigned each message) and fires on item/started. Fully fail-open —
+        # a display error never breaks the codex turn (caller also wraps
+        # on_event).
+        def _dewrap_codex_command(raw):
             # Codex runs everything as a shell command (e.g.
-            # /bin/zsh -lc "sed -n '1,5p' file"). Surfacing that raw is noisy, so
-            # strip the login-shell wrapper and classify the inner command into the
-            # same tool names the chat_completions runtime uses, so the Slack feed
-            # reads like the native trace (read_file / search_files / terminal —
-            # which carry the 📖/🔍/💻 emojis) instead of a wall of exec_command.
+            # /bin/zsh -lc "sed -n '1,5p' file"). Strip the login-shell wrapper
+            # so the inner command can be classified.
             import re as _re
             s = str(raw or "").strip()
             m = _re.match(r"^\S*(?:zsh|bash|sh|dash)\s+-[a-z]*c\s+(.*)$", s, _re.DOTALL)
@@ -79,26 +98,84 @@ def run_codex_app_server_turn(
                 if len(inner) >= 2 and inner[0] in "\"'" and inner[-1] == inner[0]:
                     inner = inner[1:-1].strip()
                 s = inner or s
-            tokens = s.split()
-            base = tokens[0].rsplit("/", 1)[-1] if tokens else ""
-            _READ = {"cat", "sed", "head", "tail", "less", "more", "bat", "nl", "awk", "jq"}
-            _SEARCH = {"rg", "grep", "egrep", "fgrep", "ag", "ack"}
-            _LIST = {"ls", "find", "fd", "tree", "exa", "eza", "stat", "du"}
-            if base in _READ:
-                name = "read_file"
-            elif base in _SEARCH or base in _LIST:
-                name = "search_files"
-            else:
-                name = "terminal"
-            nonflag = [t for t in tokens[1:] if not t.startswith("-")]
-            if name == "read_file":
-                pathlike = [t for t in nonflag if "/" in t]
-                preview = (pathlike or nonflag or [s])[-1]
-            elif name == "search_files" and nonflag:
-                preview = nonflag[0]
-            else:
-                preview = s
-            return name, str(preview)[:80]
+            return s
+
+        # Reader/searcher/lister command verbs → "코드 살펴보는 중".
+        _READ = {"cat", "sed", "head", "tail", "less", "more", "bat", "nl", "awk", "jq"}
+        _SEARCH = {"rg", "grep", "egrep", "fgrep", "ag", "ack"}
+        _LIST = {"ls", "find", "fd", "tree", "exa", "eza", "stat", "du"}
+
+        def _leos_phase(blob):
+            # LEOS-domain classification from any path / command / skill / mcp
+            # text on the item. Checked FIRST so domain work reads as itself.
+            # Case-insensitive substring match; returns (emoji, label) or None.
+            t = (blob or "").lower()
+            if not t:
+                return None
+            if (any(k in t for k in (
+                    "statutes", "bylaws", "decrees", "article-0", "constitution"))
+                    or "헌법" in (blob or "")
+                    or "leos-constitution" in t):
+                return ("⚖️", "법·헌법 확인")
+            if ("ops/contracts" in t or "/contract" in t
+                    or "계약" in (blob or "") or "leos-contract" in t):
+                return ("📜", "계약 작업")
+            if "/ledger" in t:
+                return ("📒", "원장 기록")
+            if "ops/governance" in t or "govern" in t or "gate" in t:
+                return ("🏛️", "통치·게이트")
+            if "/treaties" in t:
+                return ("🤝", "조약")
+            if "/reviews" in t:
+                return ("🔎", "감사·검토")
+            if "/users/leo/leos" in t or "/leos/" in t:
+                return ("🏛️", "LEOS 작업")
+            return None
+
+        def _codex_phase(item):
+            # Map a codex item → (emoji, label). LEOS domain wins; otherwise a
+            # generic dev phase based on the item type / command verb.
+            itype = item.get("type") or ""
+            if itype == "commandExecution":
+                cmd = _dewrap_codex_command(item.get("command"))
+                leos = _leos_phase(cmd)
+                if leos:
+                    return leos
+                tokens = cmd.split()
+                base = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+                low = cmd.lower()
+                if base in _READ or base in _SEARCH or base in _LIST:
+                    return ("📂", "코드 살펴보는 중")
+                if "pytest" in low or "run_tests" in low or base.startswith("test"):
+                    return ("🧪", "테스트")
+                if (base in ("npm", "vite", "webpack", "tsc", "yarn", "pnpm")
+                        or "npm run build" in low):
+                    return ("🔨", "빌드")
+                if base == "git":
+                    return ("📦", "커밋·git")
+                return ("💻", "명령 실행")
+            if itype == "fileChange":
+                path = str(item.get("path") or item.get("changes")
+                           or item.get("files") or "")
+                leos = _leos_phase(path)
+                if leos:
+                    return leos
+                return ("✏️", "코드 고치는 중")
+            if itype == "mcpToolCall":
+                blob = (str(item.get("server") or "") + " "
+                        + str(item.get("tool") or ""))
+                leos = _leos_phase(blob)
+                if leos:
+                    return leos
+                return ("🧰", "도구 사용")
+            if itype == "dynamicToolCall":
+                name = str(item.get("name") or "")
+                leos = _leos_phase(name)
+                if leos:
+                    return leos
+                return ("🧰", "스킬 사용")
+            # Unknown / non-tool item (e.g. reasoning) — no phase.
+            return None
 
         def _codex_progress_on_event(note):
             try:
@@ -106,21 +183,21 @@ def run_codex_app_server_turn(
                 if cb is None or note.get("method") != "item/started":
                     return
                 item = (note.get("params") or {}).get("item") or {}
-                itype = item.get("type") or ""
-                name = preview = ""
-                if itype == "commandExecution":
-                    name, preview = _humanize_codex_command(item.get("command"))
-                elif itype == "fileChange":
-                    name = "apply_patch"
-                    preview = str(item.get("path") or item.get("changes")
-                                  or item.get("files") or "")[:80]
-                elif itype == "mcpToolCall":
-                    name = ("mcp." + str(item.get("server") or "")
-                            + "." + str(item.get("tool") or "")).strip(".")[:60]
-                elif itype == "dynamicToolCall":
-                    name = str(item.get("name") or "tool")[:60]
-                if name:
-                    cb("tool.started", tool_name=name, preview=preview)
+                phase = _codex_phase(item)
+                if phase is None:
+                    return
+                # Step counter advances on EVERY recognized item, even when the
+                # phase is unchanged and no line is emitted.
+                agent._codex_step_count = getattr(agent, "_codex_step_count", 0) + 1
+                emoji, label = phase
+                # Meaningful unit: emit only when the activity SHIFTS.
+                if label != getattr(agent, "_codex_phase", None):
+                    agent._codex_phase = label
+                    cb(
+                        "tool.started",
+                        tool_name=f"{emoji} {label}",
+                        preview=f"{agent._codex_step_count}단계째",
+                    )
             except Exception:
                 pass
 

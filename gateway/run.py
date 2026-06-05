@@ -3507,7 +3507,15 @@ class GatewayRunner:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
                         status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
+                # On the codex_app_server runtime the API-call "iteration"
+                # counter stays 0 (codex runs all tools internally in a single
+                # Hermes call), so "iteration 0/60" is noise. When the codex
+                # progress bridge has counted real per-tool steps, show those
+                # instead; otherwise fall back to the iteration heartbeat.
+                _codex_steps = getattr(running_agent, "_codex_step_count", 0) or 0
+                if _codex_steps:
+                    status_parts.append(f"{_codex_steps} steps")
+                elif max_iter:
                     status_parts.append(f"iteration {iteration}/{max_iter}")
                 if current_tool:
                     status_parts.append(f"running: {current_tool}")
@@ -17132,13 +17140,25 @@ class GatewayRunner:
             # "all" / "new" modes: short preview, respects tool_preview_length
             # config (defaults to 40 chars when unset to keep gateway messages
             # compact — unlike CLI spinners, these persist as permanent messages).
+            #
+            # Some tool_names already carry their own leading emoji (e.g. the
+            # codex meaningful-unit bridge emits "⚖️ 법·헌법 확인"). Prepending
+            # the default get_tool_emoji() would double the icon, so detect a
+            # non-ASCII emoji/symbol first char (>= U+2190, the start of the
+            # arrows/symbols/emoji range) and drop the extra prefix in that case.
+            _name_has_own_emoji = bool(tool_name) and ord(tool_name[0]) >= 0x2190
             if preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                if _name_has_own_emoji:
+                    msg = f"{tool_name}: \"{preview}\""
+                else:
+                    msg = f"{emoji} {tool_name}: \"{preview}\""
+            elif _name_has_own_emoji:
+                msg = f"{tool_name}..."
             else:
                 msg = f"{emoji} {tool_name}..."
             
