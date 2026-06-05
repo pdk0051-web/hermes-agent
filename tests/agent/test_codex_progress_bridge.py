@@ -175,6 +175,24 @@ def test_leos_governance_and_treaties_and_reviews(monkeypatch):
         assert expected in calls[0][1].get("tool_name", "")
 
 
+def test_gateway_path_is_not_misread_as_governance(monkeypatch):
+    """'gateway' contains 'gate' but is ordinary dev work, not LEOS governance.
+    Reading gateway/*.py must read as 코드 살펴보는 중, never 통치·게이트."""
+    calls = []
+    agent = _make_agent(lambda *a, **k: calls.append((a, k)))
+    on_event = _run_turn_and_capture_on_event(monkeypatch, agent)
+
+    _emit(on_event, {
+        "type": "commandExecution",
+        "command": "/bin/zsh -lc \"sed -n '1,20p' gateway/run.py\"",
+    })
+
+    assert len(calls) == 1
+    name = calls[0][1].get("tool_name", "")
+    assert "통치·게이트" not in name
+    assert "코드 살펴보는 중" in name
+
+
 def test_same_phase_collapses_to_single_emit(monkeypatch):
     """Two consecutive same-phase items emit once; a third, different phase
     emits a second time (meaningful-unit collapsing)."""

@@ -122,7 +122,11 @@ def run_codex_app_server_turn(
                 return ("📜", "계약 작업")
             if "/ledger" in t:
                 return ("📒", "원장 기록")
-            if "ops/governance" in t or "govern" in t or "gate" in t:
+            # NOTE: match "gate" only as a path segment — bare "gate" would
+            # false-match "gateway" (ordinary gateway/*.py reads), "delegate",
+            # "investigate", etc. "govern" covers governance/governor (LEOS).
+            if ("ops/governance" in t or "govern" in t
+                    or "/gate/" in t or "/gates/" in t):
                 return ("🏛️", "통치·게이트")
             if "/treaties" in t:
                 return ("🤝", "조약")
