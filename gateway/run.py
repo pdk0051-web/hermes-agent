@@ -18352,9 +18352,13 @@ class GatewayRunner:
             # byte-for-byte the original behaviour. Fail-open throughout.
             _contract_gate_close = False
             if _is_resume_pending or _has_fresh_tool_tail:
-                _contract_gate_close = _contract_gate_should_close(
-                    getattr(session_entry, "session_id", None)
-                )
+                # BUGFIX 2026-06-08: use the in-scope `session_id` param. The prior
+                # `session_entry.session_id` referenced an UNDEFINED name in
+                # _run_agent (copy-pasted from _handle_message_with_agent by the
+                # contract-gate commit d3afa6133), which NameError'd the resume /
+                # fresh-tool-tail path — suppressing the auto-continue System note
+                # on every interrupted/resumed turn since 2026-06-06.
+                _contract_gate_close = _contract_gate_should_close(session_id)
 
             if _is_resume_pending and not _contract_gate_close:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
