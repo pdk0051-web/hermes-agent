@@ -1713,20 +1713,6 @@ DEFAULT_CONFIG = {
         "max_turns": 20,
     },
 
-    # Contract completion gate (STORY G001) — OFF by default.
-    #
-    # When a production run is governed by a LEOS contract that carries
-    # ``acceptance_criteria``, this lets the gateway detect FULFILLMENT
-    # (criteria met WITH evidence, per the contract's work-journal) and, when
-    # enabled, stop auto-continuing that session so it CLOSES instead of
-    # being re-driven. The pure evaluator lives in ``agent/contract_gate.py``;
-    # the gateway hook is a strict no-op while ``enabled`` is falsy, so the
-    # live system is byte-for-byte unchanged until this is explicitly turned
-    # on.
-    "contract_gate": {
-        "enabled": False,
-    },
-
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.

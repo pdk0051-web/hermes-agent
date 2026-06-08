@@ -167,6 +167,17 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # Auto-continue resolution hook. Fired by the gateway resume path
+    # (``GatewayRunner._run_agent``) ONLY when an auto-continue re-drive would
+    # otherwise fire (i.e. inside the ``_is_resume_pending or
+    # _has_fresh_tool_tail`` guard). Plugins may return a dict with a
+    # ``"suppress"`` key to SUPPRESS the auto-continue System note (e.g. a
+    # contract-completion gate that wants the session to STOP = closure rather
+    # than be revived). The first returned dict carrying ``"suppress"`` wins;
+    # an empty result list leaves the auto-continue note in place.
+    # Kwargs: session_id: str, gateway: GatewayRunner,
+    #   is_resume_pending: bool, has_fresh_tool_tail: bool.
+    "resolve_auto_continue",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

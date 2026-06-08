@@ -473,7 +473,17 @@ def _contract_gate_config_enabled() -> bool:
     try:
         from hermes_cli.config import cfg_get, load_config
 
-        return bool(cfg_get(load_config(), "contract_gate", "enabled", default=False))
+        return bool(
+            cfg_get(
+                load_config(),
+                "plugins",
+                "entries",
+                "leos-governor",
+                "contract_gate",
+                "enabled",
+                default=False,
+            )
+        )
     except Exception:
         return False
 
@@ -487,7 +497,7 @@ def _contract_gate_status() -> dict[str, Any]:
         "status": "enabled" if enabled else "disabled",
         "enabled": enabled,
         "mode": "closure_gate_active_fail_open" if enabled else "visibility_only",
-        "source": "config.contract_gate.enabled",
+        "source": "config.plugins.entries.leos-governor.contract_gate.enabled",
         "fail_open": True,
         "warnings": warnings,
     }

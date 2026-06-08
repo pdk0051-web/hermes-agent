@@ -471,170 +471,6 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
-# ---------------------------------------------------------------------------
-# Contract completion gate (STORY G001) — flag-gated, default OFF.
-#
-# When ON (config ``contract_gate.enabled`` truthy) AND the session is governed
-# by a LEOS contract that has ``acceptance_criteria``, the gateway evaluates
-# those criteria against the session's durable work-journal. If the criteria
-# are FULFILLED (met, with evidence), the gate suppresses the auto-continue
-# re-drive for that session so it STOPS (= closure) instead of being revived.
-#
-# Default OFF is load-bearing: an active long-running production session must
-# be byte-for-byte unchanged until this is explicitly enabled. Both helpers
-# below short-circuit to the no-op answer the instant the flag is falsy, and
-# every branch is fail-open (any error → behave as if the gate did nothing).
-# ---------------------------------------------------------------------------
-def _contract_gate_enabled() -> bool:
-    """Return True only when ``contract_gate.enabled`` is truthy in config.
-
-    Reads the raw ``~/.hermes/config.yaml`` (honoring a monkeypatched
-    ``_hermes_home`` in tests). Defaults to False — so when the key is absent
-    (the shipped default) this is a hard no-op. Never raises.
-    """
-    try:
-        return bool(
-            cfg_get(_load_gateway_config(), "contract_gate", "enabled", default=False)
-        )
-    except Exception:
-        return False
-
-
-def _contract_gate_governing_id(journal_records: Any) -> Optional[str]:
-    """Best-effort: the contract id governing this session, else ``None``.
-
-    There is no first-class contract binding on gateway sessions, so we detect
-    governance from the work-journal itself: ``work_journal.record_turn`` stamps
-    each record with the active ``contract_id``. The first non-empty one wins.
-    This keeps the gate strictly opt-in to *contract-governed* sessions — a
-    plain chat session has no such field and falls through untouched.
-    """
-    if not isinstance(journal_records, list):
-        return None
-    for rec in journal_records:
-        if not isinstance(rec, dict):
-            continue
-        cid = rec.get("contract_id")
-        if cid:
-            return str(cid)
-    return None
-
-
-def _contract_gate_append_closure(session_id: str, contract_id: str, result: dict) -> None:
-    """Append a closure record through the LEOS ledger CLI, or journal fallback.
-
-    The LEOS ledger is append-only and must not be mutated by raw file writes.
-    Use the sanctioned ``leos.py ledger append`` path when available; if that
-    fails, fall back to the session's work-journal. ANY failure is swallowed —
-    recording closure must never affect the run.
-    """
-    record = {
-        "ts": datetime.now().astimezone().isoformat(),
-        "kind": "contract_closure",
-        "session_id": str(session_id),
-        "contract_id": str(contract_id),
-        "status": result.get("status"),
-        "met": result.get("met"),
-        "unmet": result.get("unmet"),
-        "source": "gateway.contract_gate",
-    }
-    try:
-        leos_root = Path(os.environ.get("LEOS_ROOT") or (Path.home() / "LEOS")).expanduser()
-        leos_cli = leos_root / "scripts" / "leos.py"
-        if leos_cli.exists():
-            leos_python = leos_root / ".venv" / "bin" / "python"
-            python_bin = str(leos_python) if leos_python.exists() else sys.executable
-            subprocess.run(
-                [
-                    python_bin,
-                    str(leos_cli),
-                    "ledger",
-                    "append",
-                    "--class",
-                    "action",
-                    "--actor",
-                    "leo_hermes",
-                    "--authority",
-                    "A1",
-                    "--action-trust",
-                    "AT2",
-                    "--event",
-                    f"contract_gate:closure:{contract_id}",
-                    "--payload",
-                    json.dumps(record, ensure_ascii=False),
-                ],
-                cwd=str(leos_root),
-                env={**os.environ, "LEOS_ROOT": str(leos_root)},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-                check=True,
-            )
-            return
-    except Exception:
-        pass
-    # Fallback: append to the session's work-journal (best-effort).
-    try:
-        from agent.work_journal import _resolve_journal_dir  # local import — cheap
-
-        directory = _resolve_journal_dir(None)
-        directory.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with open(directory / f"{session_id}.jsonl", "a", encoding="utf-8") as fh:
-            fh.write(line)
-    except Exception:
-        logger.debug("contract_gate closure append failed (fail-open)", exc_info=True)
-
-
-def _contract_gate_should_close(session_id: Optional[str]) -> bool:
-    """Return True iff the contract gate decides this session should CLOSE.
-
-    Pipeline (each step fail-open, returning False on any problem):
-      1. flag off  → False (the shipped default; strict no-op).
-      2. no session id → False.
-      3. read the session work-journal; detect the governing contract id.
-         No contract-governance → False (fall through to current behaviour).
-      4. load + evaluate that contract's acceptance_criteria against the
-         journal. ``status == "met"`` → log + append a closure record + return
-         True (caller skips the auto-continue re-drive). Otherwise → False.
-    """
-    try:
-        if not _contract_gate_enabled():
-            return False
-        if not session_id:
-            return False
-
-        # Local imports keep these heavy-ish modules off the gateway import
-        # path until the gate is actually exercised (flag on + a real turn).
-        from agent import contract_gate
-        from agent.work_journal import read_journal
-
-        journal_records = read_journal(str(session_id))
-        contract_id = _contract_gate_governing_id(journal_records)
-        if not contract_id:
-            return False
-
-        contract = contract_gate.load_contract(contract_id)
-        if contract is None:
-            return False
-
-        result = contract_gate.evaluate(contract, journal_records=journal_records)
-        if result.get("status") != "met":
-            return False
-
-        logger.info(
-            "contract_gate: contract %s FULFILLED for session %s — closing "
-            "(skipping auto-continue re-drive). met=%s",
-            contract_id, session_id, result.get("met"),
-        )
-        _contract_gate_append_closure(str(session_id), contract_id, result)
-        return True
-    except Exception:
-        # Any unexpected failure must NOT alter the existing auto-continue path.
-        logger.debug("contract_gate evaluation failed (fail-open)", exc_info=True)
-        return False
-
-
 # Assistant-message fields that must survive transcript replay so multi-turn
 # reasoning context, prefix-cache hits, and provider-specific echo
 # requirements all behave the same on the gateway as they do in the CLI.
@@ -18340,25 +18176,40 @@ class GatewayRunner:
                 and _interruption_is_fresh
             )
 
-            # Contract completion gate (STORY G001) — flag-gated, default OFF.
-            # ONLY consulted when an auto-continue re-drive would otherwise
-            # fire, and ONLY does anything when ``contract_gate.enabled`` is
-            # truthy AND this session is governed by a LEOS contract whose
-            # acceptance_criteria are FULFILLED (met, with evidence) per the
-            # work-journal. When that holds we SKIP the auto-continue note so
-            # the session stops = closure. When the flag is OFF (the shipped
-            # default) ``_contract_gate_should_close`` returns False on its
-            # first line, so this is a strict no-op and the branch below is
-            # byte-for-byte the original behaviour. Fail-open throughout.
+            # Auto-continue suppression hook (de-fork Stage 3) — default OFF.
+            # ONLY consulted when an auto-continue re-drive would otherwise fire
+            # (the guard below), so plugins cannot suppress on a normal turn and
+            # the hook is not invoked every message. A plugin (e.g. the
+            # leos-governor contract-completion gate) may return
+            # ``{"suppress": True}`` to SKIP the auto-continue note so the
+            # session STOPS = closure instead of being revived. With no such
+            # plugin registered (the shipped default) ``invoke_hook`` returns an
+            # empty list, ``_contract_gate_close`` stays False, and the branches
+            # below are byte-for-byte the original behaviour. Fail-open: any hook
+            # error degrades to the empty result (no suppression). Mirrors the
+            # ``pre_gateway_dispatch`` invoke_hook precedent above.
             _contract_gate_close = False
             if _is_resume_pending or _has_fresh_tool_tail:
-                # BUGFIX 2026-06-08: use the in-scope `session_id` param. The prior
-                # `session_entry.session_id` referenced an UNDEFINED name in
-                # _run_agent (copy-pasted from _handle_message_with_agent by the
-                # contract-gate commit d3afa6133), which NameError'd the resume /
-                # fresh-tool-tail path — suppressing the auto-continue System note
-                # on every interrupted/resumed turn since 2026-06-06.
-                _contract_gate_close = _contract_gate_should_close(session_id)
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _auto_continue_results = _invoke_hook(
+                        "resolve_auto_continue",
+                        session_id=session_id,
+                        gateway=self,
+                        is_resume_pending=_is_resume_pending,
+                        has_fresh_tool_tail=_has_fresh_tool_tail,
+                    )
+                except Exception as _auto_continue_exc:
+                    logger.warning(
+                        "resolve_auto_continue invocation failed: %s",
+                        _auto_continue_exc,
+                    )
+                    _auto_continue_results = []
+
+                for _r in _auto_continue_results:
+                    if isinstance(_r, dict) and "suppress" in _r:
+                        _contract_gate_close = bool(_r["suppress"])
+                        break
 
             if _is_resume_pending and not _contract_gate_close:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
