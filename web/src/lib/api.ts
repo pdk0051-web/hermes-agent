@@ -1300,6 +1300,102 @@ export interface AgentOsSkillStatus {
   source: string;
 }
 
+export interface AgentOsBridgeStatus {
+  name: string;
+  plugin_path: string;
+  installed: boolean;
+  active: boolean;
+  version: string;
+  hooks_declared: string[];
+  required_hooks: string[];
+  hook_files: Record<string, boolean>;
+  files: Record<string, AgentOsFileStatus>;
+}
+
+export interface AgentOsCitizenStatus extends AgentOsFileStatus {
+  id: string;
+  class: string;
+  citizenship: string;
+  authority: string;
+  action_trust: string;
+  role_title: string;
+  source: string;
+  harnessed: boolean;
+}
+
+export interface AgentOsLoopRefStatus extends AgentOsFileStatus {
+  id: string;
+}
+
+export interface AgentOsLawLoopStatus {
+  status: string;
+  refs: AgentOsLoopRefStatus[];
+  in_force_prd_count: number;
+  warnings: string[];
+}
+
+export interface AgentOsContractLoopStatus {
+  status: string;
+  active_count: number;
+  cascade_tiers: Record<string, number>;
+  coexistence_active: boolean;
+  knowledge_active: boolean;
+  warnings: string[];
+}
+
+export interface AgentOsKnowledgeLoopStatus {
+  status: string;
+  refs: AgentOsLoopRefStatus[];
+  counts: Record<string, number>;
+  warnings: string[];
+}
+
+export interface AgentOsLoopStatus {
+  law: AgentOsLawLoopStatus;
+  contracts: AgentOsContractLoopStatus;
+  knowledge: AgentOsKnowledgeLoopStatus;
+}
+
+export interface AgentOsPreflightCheckStatus {
+  available: boolean;
+  ok: boolean | null;
+  exit_code: number | null;
+  summary: string;
+  failed_checks?: string[];
+  violations?: string[];
+}
+
+export interface AgentOsSignedHeadStatus {
+  sealed_entries: number | null;
+  ledger_entries: number | null;
+}
+
+export interface AgentOsPreflightStatus {
+  status: string;
+  checks: Record<string, AgentOsPreflightCheckStatus>;
+  signed_head: AgentOsSignedHeadStatus;
+  warnings: string[];
+}
+
+export interface AgentOsWorkFrameStatus {
+  status: string;
+  active_contract_ref: string | null;
+  injected_by: string | null;
+  required_fields: string[];
+  renderer_declared: boolean;
+  field_markers: Record<string, boolean>;
+  warnings: string[];
+}
+
+export interface AgentOsContractGateStatus {
+  status: string;
+  enabled: boolean;
+  mode: string;
+  source: string;
+  fail_open: boolean;
+  warnings: string[];
+}
+
 export interface AgentOsRuntimeStatus {
   api_mode: string;
   memory_provider: string;
@@ -1317,6 +1413,12 @@ export interface AgentOsStatusResponse {
   root: string;
   constitution: AgentOsFileStatus;
   contracts: AgentOsContractStatus[];
+  loop: AgentOsLoopStatus;
+  preflight: AgentOsPreflightStatus;
+  bridge: AgentOsBridgeStatus;
+  work_frame: AgentOsWorkFrameStatus;
+  contract_gate: AgentOsContractGateStatus;
+  citizens: AgentOsCitizenStatus[];
   skills: AgentOsSkillStatus[];
   runtime: AgentOsRuntimeStatus;
   validation: AgentOsValidationStatus;

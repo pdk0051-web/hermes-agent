@@ -40,18 +40,73 @@ const DEFAULT_LAYOUT: ThemeLayout = {
 
 export const defaultTheme: DashboardTheme = {
   name: "default",
-  label: "Hermes Teal",
-  description: "Classic dark teal — the canonical Hermes look",
+  label: "Valley Console",
+  description: "Light Valley-inspired operator console",
   palette: {
-    background: { hex: "#041c1c", alpha: 1 },
-    midground: { hex: "#ffe6cb", alpha: 1 },
+    background: { hex: "#fcfcfd", alpha: 1 },
+    midground: { hex: "#2f9c46", alpha: 1 },
     foreground: { hex: "#ffffff", alpha: 0 },
-    warmGlow: "rgba(255, 189, 56, 0.35)",
-    noiseOpacity: 1,
+    warmGlow: "rgba(88, 191, 103, 0.18)",
+    noiseOpacity: 0.32,
   },
-  typography: DEFAULT_TYPOGRAPHY,
-  layout: DEFAULT_LAYOUT,
-  terminalBackground: "#000000",
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"Pretendard Variable", "Pretendard", ${SYSTEM_SANS}`,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    baseSize: "15px",
+    lineHeight: "1.5",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0.375rem",
+  },
+  terminalBackground: "#06130a",
+  componentStyles: {
+    backdrop: {
+      fillerOpacity: "0.015",
+    },
+    card: {
+      background: "color-mix(in srgb, #ffffff 92%, #58bf67 8%)",
+      boxShadow: "0 1px 0 rgba(47, 156, 70, 0.14)",
+    },
+    header: {
+      background: "rgba(252, 252, 253, 0.92)",
+    },
+    sidebar: {
+      background: "rgba(252, 252, 253, 0.94)",
+    },
+  },
+  colorOverrides: {
+    card: "#ffffff",
+    cardForeground: "#12321b",
+    primary: "#2f9c46",
+    primaryForeground: "#ffffff",
+    secondary: "#eef8f0",
+    secondaryForeground: "#12321b",
+    muted: "#f2f7f3",
+    mutedForeground: "#42624a",
+    accent: "#e8f6eb",
+    accentForeground: "#12321b",
+    border: "#d8eadc",
+    input: "#d8eadc",
+    ring: "#58bf67",
+    success: "#58bf67",
+    warning: "#b7791f",
+    destructive: "#c0392b",
+  },
+  seriesColors: {
+    inputTokenAccent: "#2f9c46",
+    outputTokenAccent: "#58bf67",
+  },
+  swatchColors: ["#fcfcfd", "#2f9c46", "#58bf67"],
+  customCSS: `
+    [data-layout-variant="standard"] {
+      --valley-console-surface: #ffffff;
+      --valley-console-canvas: #fcfcfd;
+      --valley-console-accent: #58bf67;
+      --valley-console-strong: #2f9c46;
+    }
+  `,
 };
 
 export const midnightTheme: DashboardTheme = {
@@ -285,8 +340,8 @@ export const nousBlueTheme: DashboardTheme = {
  */
 export const defaultLargeTheme: DashboardTheme = {
   name: "default-large",
-  label: "Hermes Teal (Large)",
-  description: "Hermes Teal with bigger fonts and roomier spacing",
+  label: "Valley Console (Large)",
+  description: "Valley Console with bigger fonts and roomier spacing",
   palette: defaultTheme.palette,
   typography: {
     ...DEFAULT_TYPOGRAPHY,

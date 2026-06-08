@@ -10,7 +10,8 @@
     "web"
   ],
   "scripts": {
-    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'"
+    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
+    "agent-os:screenshot": "node scripts/agent_os_dashboard_screenshot.mjs"
   },
   "repository": {
     "type": "git",
@@ -30,5 +31,9 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@playwright/mcp": "^0.0.75",
+    "@playwright/test": "^1.60.0"
   }
 }

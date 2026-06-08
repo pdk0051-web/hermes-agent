@@ -205,6 +205,26 @@ def test_read_journal_tolerates_junk_and_missing(tmp_path):
     assert records[0]["summary"] == "ok"
 
 
+def test_default_journal_dir_falls_back_when_leos_journal_is_not_writable(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    leos_root = home / "LEOS"
+    leos_root.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    def fake_access(path, mode):
+        resolved = work_journal.Path(path)
+        if resolved == leos_root:
+            return False
+        return True
+
+    monkeypatch.setattr(work_journal.os, "access", fake_access)
+
+    assert work_journal._resolve_journal_dir(None) == home / ".hermes" / "journal"
+
+
 def test_record_turn_fail_open_returns_none(tmp_path):
     # Make the resolved journal dir UNCREATABLE by rooting it under a regular
     # file: mkdir(parents=True) then raises, and the guard must swallow it.

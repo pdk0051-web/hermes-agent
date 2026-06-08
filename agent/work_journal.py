@@ -17,7 +17,8 @@ Design rules:
 
 Directory resolution (write and read share it):
     1. explicit ``journal_dir`` argument, else
-    2. ``~/LEOS/journal/`` when ``~/LEOS`` exists, else
+    2. ``~/LEOS/journal/`` when ``~/LEOS`` exists and the journal path is
+       writable, else
     3. ``~/.hermes/journal/``.
 The directory is created (``mkdir -p``) on write.
 """
@@ -40,13 +41,32 @@ _TARGET_MAX = 80
 _MAX_STEPS = 40
 
 
+def _journal_path_writable(path: Path) -> bool:
+    """Best-effort check that ``path`` can be used for journal writes.
+
+    ``~/LEOS`` may exist but be governed by a stronger OS ownership boundary.
+    In that case choosing ``~/LEOS/journal`` makes every journal write fail
+    open and also prevents the contract gate from seeing completion records.
+    If the journal directory does not exist yet, test the parent directory
+    because ``record_turn`` will create the journal directory later.
+    """
+    try:
+        if path.exists():
+            return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+        parent = path.parent
+        return parent.exists() and os.access(parent, os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+
 def _resolve_journal_dir(journal_dir: Optional[str | os.PathLike]) -> Path:
     """Resolve the journal directory. See module docstring for the order."""
     if journal_dir is not None:
         return Path(journal_dir)
     leos_root = Path.home() / "LEOS"
-    if leos_root.exists():
-        return leos_root / "journal"
+    leos_journal = leos_root / "journal"
+    if leos_root.exists() and _journal_path_writable(leos_journal):
+        return leos_journal
     return Path.home() / ".hermes" / "journal"
 
 

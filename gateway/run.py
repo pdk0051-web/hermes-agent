@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import signal
 import tempfile
@@ -520,12 +521,12 @@ def _contract_gate_governing_id(journal_records: Any) -> Optional[str]:
 
 
 def _contract_gate_append_closure(session_id: str, contract_id: str, result: dict) -> None:
-    """Append a closure record to the LEOS ledger (or journal). Fail-open.
+    """Append a closure record through the LEOS ledger CLI, or journal fallback.
 
-    Tries ``~/LEOS/ledger/main.jsonl`` first; if that is unwritable (the
-    ledger is owned by the governance user on some hosts), falls back to the
-    session's own work-journal directory. ANY failure is swallowed — recording
-    closure must never affect the run.
+    The LEOS ledger is append-only and must not be mutated by raw file writes.
+    Use the sanctioned ``leos.py ledger append`` path when available; if that
+    fails, fall back to the session's work-journal. ANY failure is swallowed —
+    recording closure must never affect the run.
     """
     record = {
         "ts": datetime.now().astimezone().isoformat(),
@@ -537,13 +538,38 @@ def _contract_gate_append_closure(session_id: str, contract_id: str, result: dic
         "unmet": result.get("unmet"),
         "source": "gateway.contract_gate",
     }
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    # Primary target: the LEOS ledger.
     try:
-        ledger = Path.home() / "LEOS" / "ledger" / "main.jsonl"
-        if ledger.parent.exists():
-            with open(ledger, "a", encoding="utf-8") as fh:
-                fh.write(line)
+        leos_root = Path(os.environ.get("LEOS_ROOT") or (Path.home() / "LEOS")).expanduser()
+        leos_cli = leos_root / "scripts" / "leos.py"
+        if leos_cli.exists():
+            leos_python = leos_root / ".venv" / "bin" / "python"
+            python_bin = str(leos_python) if leos_python.exists() else sys.executable
+            subprocess.run(
+                [
+                    python_bin,
+                    str(leos_cli),
+                    "ledger",
+                    "append",
+                    "--class",
+                    "action",
+                    "--actor",
+                    "leo_hermes",
+                    "--authority",
+                    "A1",
+                    "--action-trust",
+                    "AT2",
+                    "--event",
+                    f"contract_gate:closure:{contract_id}",
+                    "--payload",
+                    json.dumps(record, ensure_ascii=False),
+                ],
+                cwd=str(leos_root),
+                env={**os.environ, "LEOS_ROOT": str(leos_root)},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=True,
+            )
             return
     except Exception:
         pass
@@ -553,6 +579,7 @@ def _contract_gate_append_closure(session_id: str, contract_id: str, result: dic
 
         directory = _resolve_journal_dir(None)
         directory.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
         with open(directory / f"{session_id}.jsonl", "a", encoding="utf-8") as fh:
             fh.write(line)
     except Exception:
