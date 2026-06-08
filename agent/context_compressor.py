@@ -91,19 +91,6 @@ _SUMMARY_TOKENS_CEILING = 12_000
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
-# Journal statuses that mark a unit of work as finished. Mirrors
-# ``agent.contract_gate._DONE_STATUSES`` (kept in sync deliberately rather
-# than imported, to avoid coupling the compressor to the contract module).
-# Only messages that CONFIDENTLY map to a record with one of these statuses
-# are eligible for eviction by the flag-gated curation branch.
-_DONE_JOURNAL_STATUSES = frozenset({"done", "completed", "complete", "closed"})
-
-# Minimum length (chars) of a message's text before it can be used as a
-# content-reference key against a journal record's summary. Short snippets
-# ("ok", "done.", "running tests") collide too easily across turns, so any
-# message shorter than this is treated as UNMAPPABLE and kept (never evicted).
-_CURATION_MIN_REF_CHARS = 24
-
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 # Flat token cost per attached image part.  Real cost varies by provider and
@@ -693,22 +680,6 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
-        # Session id captured from on_session_start. Used ONLY by the
-        # flag-gated journal-curation branch (compression.curation_enabled)
-        # to locate this session's work-journal. None until a session starts.
-        self._session_id: Optional[str] = None
-
-    def on_session_start(self, session_id: str, **kwargs) -> None:
-        """Capture the active session id for the curation branch.
-
-        The base ``ContextEngine.on_session_start`` is a no-op; we override it
-        only to remember ``session_id`` so the flag-gated journal-curation
-        path in :meth:`compress` can read this session's work-journal. This
-        sets a single attribute and changes nothing about compression when
-        ``compression.curation_enabled`` is off.
-        """
-        if session_id:
-            self._session_id = str(session_id)
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1850,221 +1821,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
-    # Flag-gated journal-curation (compression.curation_enabled)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _curation_enabled() -> bool:
-        """Read ``compression.curation_enabled`` (default False).
-
-        Lazy-imports ``load_config`` (cached) the same way the auxiliary
-        client reads config, so the compressor needs no constructor wiring.
-        Any error → False (the existing flat-summary path runs unchanged).
-        """
-        try:
-            from hermes_cli.config import load_config
-
-            comp = load_config().get("compression", {}) or {}
-            return str(comp.get("curation_enabled", False)).lower() in {
-                "true", "1", "yes",
-            }
-        except Exception:
-            logger.debug("curation: config read failed (fall back)", exc_info=True)
-            return False
-
-    @staticmethod
-    def _record_done(record: Any) -> bool:
-        """True iff a journal record carries a done-like status."""
-        if not isinstance(record, dict):
-            return False
-        status = str(record.get("status") or "").strip().lower()
-        return status in _DONE_JOURNAL_STATUSES
-
-    @staticmethod
-    def _record_summary_text(record: dict) -> str:
-        """The human ``summary`` (turn final_text) of a journal record."""
-        return str(record.get("summary") or "").strip()
-
-    @staticmethod
-    def _record_step_targets(record: dict) -> List[str]:
-        """Non-empty ``steps[].target`` previews of a journal record."""
-        targets: List[str] = []
-        steps = record.get("steps")
-        if isinstance(steps, (list, tuple)):
-            for step in steps:
-                if isinstance(step, dict):
-                    tgt = step.get("target")
-                    if tgt:
-                        targets.append(str(tgt))
-        return targets
-
-    @classmethod
-    def _record_marker(cls, record: dict) -> str:
-        """One-line eviction marker for a done record: ``[done] <kind> <target>``.
-
-        ``kind``/``target`` come from the record's first journal step (the most
-        representative action of the turn); falls back to a clipped summary so
-        the marker is never empty. Kept short — its meaning lives in the
-        journal, this is only a transcript breadcrumb.
-        """
-        kind = ""
-        target = ""
-        steps = record.get("steps")
-        if isinstance(steps, (list, tuple)):
-            for step in steps:
-                if isinstance(step, dict) and step.get("kind"):
-                    kind = str(step.get("kind"))
-                    target = str(step.get("target") or "")
-                    break
-        if not kind:
-            summary = cls._record_summary_text(record)
-            target = (summary[:60] + "…") if len(summary) > 61 else summary
-        marker = f"[done] {kind} {target}".strip()
-        return marker if marker != "[done]" else "[done] work"
-
-    @classmethod
-    def _message_maps_to_done_record(
-        cls,
-        msg: Dict[str, Any],
-        done_records: List[dict],
-    ) -> Optional[dict]:
-        """Return the done record a middle message CONFIDENTLY maps to, or None.
-
-        Bias is hard toward None (keep): a message is only mapped when there is
-        a concrete reference between it and a *done* record —
-
-          * content reference — the message's text (when long enough to be
-            distinctive, ``>= _CURATION_MIN_REF_CHARS``) appears in the
-            record's ``summary`` (the turn's final_text the journal captured),
-            or the record's summary appears in the message; OR
-          * step/target reference — the message is a tool call whose target
-            (command / path) appears verbatim in one of the record's
-            ``steps[].target`` previews.
-
-        Conversational turns, plain text that matches nothing, and anything
-        whose only candidate record is in-progress/blocked all return None and
-        are left to the existing summarizer. Never raises.
-        """
-        try:
-            if not isinstance(msg, dict):
-                return None
-
-            text = _content_text_for_contains(msg.get("content")).strip()
-
-            # 1) Content reference against a done record's summary.
-            if len(text) >= _CURATION_MIN_REF_CHARS:
-                low = text.lower()
-                for rec in done_records:
-                    summary = cls._record_summary_text(rec)
-                    if len(summary) < _CURATION_MIN_REF_CHARS:
-                        continue
-                    s_low = summary.lower()
-                    if low in s_low or s_low in low:
-                        return rec
-
-            # 2) Step/target reference against a done record's steps.
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                call_targets: List[str] = []
-                for tc in tool_calls:
-                    if not isinstance(tc, dict):
-                        continue
-                    fn = tc.get("function") or {}
-                    args = fn.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            parsed = json.loads(args)
-                        except Exception:
-                            parsed = None
-                    elif isinstance(args, dict):
-                        parsed = args
-                    else:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        for key in ("command", "path", "file_path", "cwd"):
-                            val = parsed.get(key)
-                            if val:
-                                call_targets.append(str(val).strip())
-                for rec in done_records:
-                    rec_targets = cls._record_step_targets(rec)
-                    for ct in call_targets:
-                        if len(ct) < _CURATION_MIN_REF_CHARS:
-                            continue
-                        for rt in rec_targets:
-                            if ct in rt or rt in ct:
-                                return rec
-            return None
-        except Exception:
-            logger.debug("curation: mapping check failed (keep)", exc_info=True)
-            return None
-
-    def _curate_done_evictions(
-        self,
-        middle: List[Dict[str, Any]],
-        journal_records: List[dict],
-    ) -> Optional[tuple[List[str], List[Dict[str, Any]]]]:
-        """Partition the middle window into evicted-done markers and kept turns.
-
-        Returns ``(markers, kept)`` where ``markers`` are one-line ``[done] …``
-        strings for middle messages that CONFIDENTLY mapped to a done journal
-        record (their tokens are dropped) and ``kept`` is every other middle
-        message, untouched, to flow through the existing summarizer.
-
-        Safety:
-          * Returns ``None`` (→ caller uses the unchanged flat path) when the
-            journal yields no done records, when nothing maps, or on ANY error.
-          * Never evicts a tool *result* (role == "tool") on its own — only the
-            assistant turn that references a done record is evicted; orphaned
-            results are cleaned up downstream by ``_sanitize_tool_pairs``. A
-            ``tool`` message is kept unless its parent assistant turn was
-            evicted, so we never strip a result whose call survives.
-          * Over-keeping is fine; wrong-evicting is data loss — so every
-            uncertain message is kept.
-        """
-        try:
-            done_records = [r for r in journal_records if self._record_done(r)]
-            if not done_records:
-                return None
-
-            markers: List[str] = []
-            kept: List[Dict[str, Any]] = []
-            # Track whether the immediately-preceding assistant turn was
-            # evicted so its trailing tool results can be evicted with it
-            # (keeping tool pairs consistent). Reset on any non-tool message.
-            prev_assistant_evicted = False
-
-            for msg in middle:
-                role = msg.get("role") if isinstance(msg, dict) else None
-
-                if role == "tool":
-                    # A tool result rides with its parent assistant call: evict
-                    # it only if that parent was evicted, else keep it.
-                    if prev_assistant_evicted:
-                        continue
-                    kept.append(msg)
-                    continue
-
-                # Non-tool message resets the tool-pair carry.
-                prev_assistant_evicted = False
-
-                rec = self._message_maps_to_done_record(msg, done_records)
-                if rec is not None and role == "assistant":
-                    markers.append(self._record_marker(rec))
-                    prev_assistant_evicted = True
-                    continue
-
-                # Everything else (user/system/unmapped/in-progress) is kept.
-                kept.append(msg)
-
-            if not markers:
-                # Nothing confidently evicted — no benefit over the flat path.
-                return None
-            return markers, kept
-        except Exception:
-            logger.debug("curation: partition failed (fall back)", exc_info=True)
-            return None
-
-    # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
 
@@ -2154,42 +1910,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 self._previous_summary = summary_body
             turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
 
-        # Flag-gated journal-curation (compression.curation_enabled, default
-        # OFF). When enabled, evict middle messages that CONFIDENTLY map to a
-        # "done" work-journal record — their meaning already lives in the
-        # journal — and only summarize the remainder. Every guard below falls
-        # back to the unchanged flat path (markers stay empty), so the OFF
-        # path and any uncertain ON case are byte-for-byte the prior behavior.
-        _curation_markers: List[str] = []
-        if self._curation_enabled():
-            try:
-                _sid = self._session_id
-                if _sid:
-                    from agent.work_journal import read_journal
-
-                    _records = read_journal(_sid)
-                    if _records:
-                        _curated = self._curate_done_evictions(
-                            turns_to_summarize, _records,
-                        )
-                        if _curated is not None:
-                            _curation_markers, turns_to_summarize = _curated
-            except Exception:
-                # ANY failure in the curation branch → flat path unchanged.
-                logger.debug(
-                    "curation: branch failed (fall back to flat summary)",
-                    exc_info=True,
-                )
-                _curation_markers = []
-
         if not self.quiet_mode:
-            if _curation_markers:
-                logger.info(
-                    "Curation: evicted %d done middle message(s) to journal "
-                    "markers, summarizing %d remaining",
-                    len(_curation_markers),
-                    len(turns_to_summarize),
-                )
             logger.info(
                 "Context compression triggered (%d tokens >= %d threshold)",
                 display_tokens,
@@ -2211,16 +1932,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary.
-        # Curation edge case: if every middle message was evicted to a journal
-        # marker, there is nothing left to summarize — skip the LLM call (and
-        # the failure/abort/fallback handling, which all assume a real summary
-        # attempt) and let the markers alone carry the compacted region.
-        _curation_only = bool(_curation_markers) and not turns_to_summarize
-        if _curation_only:
-            summary = None
-        else:
-            summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        # Phase 3: Generate structured summary
+        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2233,7 +1946,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         #           _last_summary_dropped_count for gateway hygiene to
         #           surface a warning.
         # Default is False (historical behavior).
-        if not _curation_only and not summary and self.abort_on_summary_failure:
+        if not summary and self.abort_on_summary_failure:
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
             self._last_summary_fallback_used = False
@@ -2264,10 +1977,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # If LLM summary failed, insert a deterministic fallback so the model
         # gets at least locally recoverable continuity anchors instead of a
-        # content-free "N messages were removed" marker. Skipped when the
-        # region was fully curated away (no summary was attempted — the
-        # journal markers below are the intended, lossless replacement).
-        if not summary and not _curation_only:
+        # content-free "N messages were removed" marker.
+        if not summary:
             if not self.quiet_mode:
                 logger.warning("Summary generation failed — inserting deterministic fallback context summary")
             n_dropped = compress_end - compress_start
@@ -2277,25 +1988,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 turns_to_summarize,
                 reason=self._last_summary_error,
             )
-
-        # Curation: fold the one-line journal markers for evicted done work
-        # into the handoff summary ahead of whatever remains (or let them stand
-        # alone when the region was fully curated). These are factual
-        # breadcrumbs whose full meaning lives in the work-journal. The markers
-        # go INSIDE the SUMMARY_PREFIX wrapper (strip → prepend → re-wrap) so
-        # the block still registers as a context summary for iterative
-        # re-compression and carries the "reference, not instructions" framing.
-        if _curation_markers:
-            marker_block = "## Completed (evicted to work-journal)\n" + "\n".join(
-                _curation_markers
-            )
-            existing_body = self._strip_summary_prefix(summary) if summary else ""
-            combined_body = (
-                marker_block
-                if not existing_body
-                else (marker_block + "\n\n" + existing_body)
-            )
-            summary = self._with_summary_prefix(combined_body)
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

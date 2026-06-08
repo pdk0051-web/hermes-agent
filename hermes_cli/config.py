@@ -1139,19 +1139,6 @@ DEFAULT_CONFIG = {
                                       # Default False matches historical behavior; set to
                                       # True if you'd rather pause than silently lose
                                       # context turns when your aux model is flaky.
-        "curation_enabled": False,    # When True, compaction EVICTS middle messages that
-                                      # confidently map to a "done" work-journal record
-                                      # (replacing each with a one-line `[done] <kind>
-                                      # <target>` marker) instead of funneling that already
-                                      # journaled work through the lossy LLM summarizer;
-                                      # only in-progress/blocked/conversational/uncertain
-                                      # middle turns are still summarized. The meaning of
-                                      # done work already lives in the work-journal, so
-                                      # evicting it from the transcript is lossless. Mapping
-                                      # is HIGH-confidence only and biased hard toward
-                                      # KEEPING — an unmappable message is summarized, never
-                                      # evicted. Default False = current flat-summary
-                                      # behavior, byte-for-byte unchanged.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
