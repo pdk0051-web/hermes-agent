@@ -184,6 +184,38 @@ def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
     return f"call_{digest}"
 
 
+def _cap_call_id(call_id: str) -> str:
+    """Cap a tool call_id to the Responses API's 64-char ``input[].call_id`` limit.
+
+    The ChatGPT Codex OAuth backend (chatgpt.com/backend-api/codex) mints MCP
+    tool call_ids by concatenating the MCP server/app/tool path, e.g.
+    ``codex_mcp_codex_apps_slack_slack_read_thread_call_<suffix>`` — a Slack
+    thread-read lands at 74 chars. That ``codex_mcp_`` prefix is BACKEND-
+    generated (not produced anywhere in our code), so we cannot shorten it at
+    the source. When Hermes echoes the id back in the next request's ``input``,
+    the SAME endpoint rejects it non-retryably with HTTP 400
+    ``Invalid input[N].call_id: string too long (max 64, got 74)`` and kills
+    the turn. Plain ``codex_exec_*`` ids (~31 chars) are unaffected.
+
+    The fix normalizes any over-limit id to a deterministic SHA-256 digest:
+    ``call_<24 hex>`` (29 chars). Properties that make this safe:
+
+    - Deterministic + idempotent: the same original always maps to the same
+      capped id, and a capped id (≤64) passes back through unchanged. This is
+      load-bearing — a ``function_call`` and its ``function_call_output`` are
+      paired by call_id, and the API rejects the request if the two ids don't
+      match. Applying this helper to BOTH sides of the pair from the SAME
+      original guarantees they still match after capping.
+    - Zero behavior change on the common path: ids ≤64 chars (and non-str
+      inputs) are returned unchanged, so ``codex_exec_*`` / ``call_*`` ids are
+      byte-for-byte identical to today and prompt-cache prefixes are preserved.
+    """
+    if not isinstance(call_id, str) or len(call_id) <= 64:
+        return call_id
+    digest = hashlib.sha256(call_id.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"call_{digest}"
+
+
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
     """Split a stored tool id into (call_id, response_item_id)."""
     if not isinstance(raw_id, str):
@@ -484,7 +516,13 @@ def _chat_messages_to_responses_input(
                             else:
                                 _raw_args = str(fn.get("arguments", "{}"))
                                 call_id = _deterministic_call_id(fn_name, _raw_args, len(items))
-                        call_id = call_id.strip()
+                        # Cap to the 64-char Responses input[].call_id limit.
+                        # Backend-minted MCP ids (codex_mcp_…, up to 74 chars)
+                        # would otherwise 400 the next request. Idempotent +
+                        # deterministic, so this function_call and its paired
+                        # function_call_output (capped identically below) keep
+                        # matching call_ids. See _cap_call_id.
+                        call_id = _cap_call_id(call_id.strip())
 
                         arguments = fn.get("arguments", "{}")
                         if isinstance(arguments, dict):
@@ -536,9 +574,13 @@ def _chat_messages_to_responses_input(
             else:
                 output_value = str(tool_content or "")
 
+            # Cap to the 64-char limit with the SAME deterministic mapping as
+            # the function_call side, so the paired entries keep matching
+            # call_ids (the API 400s a function_call_output whose call_id has
+            # no matching function_call). See _cap_call_id.
             items.append({
                 "type": "function_call_output",
-                "call_id": call_id,
+                "call_id": _cap_call_id(call_id),
                 "output": output_value,
             })
 

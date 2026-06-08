@@ -269,6 +269,7 @@ class ResponsesApiTransport(ProviderTransport):
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""
         from agent.codex_responses_adapter import (
+            _cap_call_id,
             _normalize_codex_response,
         )
 
@@ -286,7 +287,14 @@ class ResponsesApiTransport(ProviderTransport):
             for tc in msg.tool_calls:
                 provider_data = {}
                 if hasattr(tc, "call_id") and tc.call_id:
-                    provider_data["call_id"] = tc.call_id
+                    # Cap at the RECEIVE chokepoint so the backend-minted MCP
+                    # call_id (codex_mcp_…, up to 74 chars) is normalized to
+                    # ≤64 from a single source. Everything downstream — the
+                    # persisted ToolCall, the matching function_call_output,
+                    # and the next request's input — derives from this capped
+                    # value, keeping the function_call/output pair matched.
+                    # Idempotent: re-capping in the request builder is a no-op.
+                    provider_data["call_id"] = _cap_call_id(tc.call_id)
                 if hasattr(tc, "response_item_id") and tc.response_item_id:
                     provider_data["response_item_id"] = tc.response_item_id
                 tool_calls.append(ToolCall(

@@ -233,6 +233,178 @@ class TestRunConversationCodexPath:
         assert not client_mock.chat.completions.create.called
 
 
+class _RecordingSessionDB:
+    """Minimal fake of hermes_state.SessionDB for asserting the codex turn
+    is flushed to the `messages` table. Records every append_message call."""
+
+    def __init__(self) -> None:
+        self.appended: list[dict] = []
+
+    def append_message(self, **kwargs):
+        self.appended.append(kwargs)
+        return len(self.appended)
+
+    # _flush_messages_to_session_db only calls append_message; create_session
+    # is gated behind _session_db_created which the tests set True up front.
+    def create_session(self, *a, **kw):  # pragma: no cover - not reached
+        return "stub-session"
+
+    # Other SessionDB methods touched incidentally during run_conversation
+    # (system-prompt cache, token accounting). No-ops keep the fake quiet.
+    def update_system_prompt(self, *a, **kw):
+        return None
+
+    def get_session(self, *a, **kw):
+        return None
+
+    def update_token_counts(self, *a, **kw):
+        return None
+
+
+def _attach_recording_db(agent) -> "_RecordingSessionDB":
+    """Wire a recording SQLite stub onto an already-built agent so the
+    persistence path (_persist_session → _flush_messages_to_session_db) runs.
+    Sets _session_db_created=True so _ensure_db_session/create_session is
+    skipped, and resets the dedup cursor to 0."""
+    db = _RecordingSessionDB()
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = 0
+    return db
+
+
+class TestCodexTurnPersistedToDb:
+    """DATA-LOSS REGRESSION GUARD (codex_app_server path).
+
+    Before the fix, the early-return at conversation_loop.py for
+    api_mode='codex_app_server' bypassed the chat_completions loop — the ONLY
+    place _persist_session() runs on exit. So an interactive codex turn never
+    reached the `messages` SQLite table (only the one-time session_meta row
+    landed). These tests pin that a codex turn flushes its messages exactly
+    once, that the flush includes the USER turn + tool-result roles (faithful
+    replay), and that a re-entry does not double-write."""
+
+    def test_codex_turn_flushes_messages_to_db(self, fake_session):
+        agent = _make_codex_agent()
+        db = _attach_recording_db(agent)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("persist me please")
+
+        # The flush must have run (regression: it didn't at all before).
+        assert db.appended, (
+            "codex turn produced NO DB rows — _persist_session was bypassed"
+        )
+        roles = [row.get("role") for row in db.appended]
+        # Faithful replay needs the user turn, the assistant, and the tool
+        # result — exactly the messages the loop's normal exit would persist.
+        assert "user" in roles, f"user turn missing from DB flush: {roles}"
+        assert "assistant" in roles, f"assistant missing from DB flush: {roles}"
+        assert "tool" in roles, f"tool result missing from DB flush: {roles}"
+
+    def test_user_text_and_tool_output_land_in_db(self, fake_session):
+        """The user's actual text and the tool's output content must be the
+        persisted values — proves we flush the complete `messages` source,
+        not the role-incomplete projected_messages."""
+        agent = _make_codex_agent()
+        db = _attach_recording_db(agent)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("unique-user-text-42")
+
+        user_rows = [r for r in db.appended if r.get("role") == "user"]
+        tool_rows = [r for r in db.appended if r.get("role") == "tool"]
+        assert any(r.get("content") == "unique-user-text-42" for r in user_rows), (
+            f"user text not persisted; user rows: {user_rows}"
+        )
+        # fake_session's tool result content is "ok".
+        assert any(r.get("content") == "ok" for r in tool_rows), (
+            f"tool output not persisted; tool rows: {tool_rows}"
+        )
+
+    def test_flush_count_matches_message_count(self, fake_session):
+        """One turn = user(1) + projected(3) = 4 rows, flushed once."""
+        agent = _make_codex_agent()
+        db = _attach_recording_db(agent)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("count me")
+        # Every message in the final list should have been appended exactly once.
+        assert len(db.appended) == len(result["messages"]), (
+            f"flushed {len(db.appended)} rows for "
+            f"{len(result['messages'])} messages: {db.appended}"
+        )
+
+    def test_reentry_does_not_double_write(self, fake_session):
+        """A follow-up turn must only flush the NEW turn's rows, never re-write
+        the prior turn's already-persisted history. This mirrors how the
+        gateway's interactive path drives it: each turn threads the accumulated
+        prior messages back in as ``conversation_history`` (reconstructed from
+        the DB), which sets the flush FLOOR (start_idx=len(history)) so the new
+        agent's fresh _last_flushed_db_idx=0 cursor can't replay old rows."""
+        # Turn 1 — fresh agent, no history (first message of the session).
+        agent1 = _make_codex_agent()
+        db = _attach_recording_db(agent1)
+        with patch.object(agent1, "_spawn_background_review", return_value=None):
+            r1 = agent1.run_conversation("turn one")
+        after_first = len(db.appended)
+        assert after_first == len(r1["messages"])  # user + 3 projected = 4 rows
+
+        # Turn 2 — a fresh agent (as the gateway builds per turn) sharing the
+        # SAME session DB, threading turn 1's transcript as history.
+        agent2 = _make_codex_agent()
+        agent2._session_db = db          # same DB across turns
+        agent2._session_db_created = True
+        agent2._last_flushed_db_idx = 0  # fresh agent starts at 0
+        prior_history = list(r1["messages"])
+        with patch.object(agent2, "_spawn_background_review", return_value=None):
+            r2 = agent2.run_conversation(
+                "turn two", conversation_history=prior_history
+            )
+        # Only turn 2's own new messages (user + 3 projected) get flushed; the
+        # 4 history rows are below the floor and are NOT re-appended.
+        new_rows = len(db.appended) - after_first
+        assert new_rows == len(r2["messages"]) - len(prior_history), (
+            f"re-entry double-wrote: total={len(db.appended)} "
+            f"after_first={after_first} history={len(prior_history)} "
+            f"r2_total={len(r2['messages'])}"
+        )
+        # No user text appears twice across the whole DB.
+        user_texts = [
+            r.get("content") for r in db.appended if r.get("role") == "user"
+        ]
+        assert user_texts.count("turn one") == 1, user_texts
+        assert user_texts.count("turn two") == 1, user_texts
+
+    def test_explicit_reflush_same_messages_is_noop(self, fake_session):
+        """Directly calling the persist path again with the SAME messages
+        list must write nothing new — pins _last_flushed_db_idx dedup so the
+        gateway's parallel skip_db pass can't create duplicate rows."""
+        agent = _make_codex_agent()
+        db = _attach_recording_db(agent)
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("once")
+        count_after_turn = len(db.appended)
+        # Re-run the exact flush the loop just did — must be a no-op.
+        agent._persist_session(result["messages"], None)
+        assert len(db.appended) == count_after_turn, (
+            "re-flushing identical messages wrote duplicate rows"
+        )
+
+    def test_persistence_error_does_not_break_turn(self, fake_session):
+        """Fail-open: if the DB flush raises, the codex turn result must still
+        be returned intact (mirrors the journal hook's fail-open)."""
+        agent = _make_codex_agent()
+        _attach_recording_db(agent)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("db write exploded")
+
+        with patch.object(agent, "_persist_session", side_effect=boom), \
+                patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("survive the db error")
+        assert result["final_response"] == "echo: survive the db error"
+        assert result["completed"] is True
+        assert result["error"] is None
+
+
 class TestReviewForkApiModeDowngrade:
     """When the parent agent runs on codex_app_server, the background
     review fork must downgrade to codex_responses — otherwise the fork

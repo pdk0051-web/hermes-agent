@@ -3,9 +3,98 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_responses_adapter import (
+    _cap_call_id,
+    _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
 )
+
+
+# ---------------------------------------------------------------------------
+# _cap_call_id — the ChatGPT Codex OAuth backend mints MCP tool call_ids like
+# ``codex_mcp_codex_apps_slack_slack_read_thread_call_<suffix>`` (74 chars for
+# a Slack thread-read) that exceed the Responses API's 64-char
+# ``input[].call_id`` limit. Echoing one back 400s the turn non-retryably, so
+# we deterministically cap over-limit ids while leaving the common ≤64 path
+# untouched. A function_call and its function_call_output are paired by
+# call_id, so the mapping MUST be deterministic and applied to both sides.
+# ---------------------------------------------------------------------------
+
+# The exact 74-char backend-minted id from the bug report.
+_LONG_MCP_CALL_ID = "codex_mcp_codex_apps_slack_slack_read_thread_call_JWmMSWefhN9eE5lwl8S33Ekk"
+
+
+def test_cap_call_id_shortens_overlong_mcp_id_deterministically():
+    assert len(_LONG_MCP_CALL_ID) == 74  # guards the fixture against drift
+
+    capped = _cap_call_id(_LONG_MCP_CALL_ID)
+
+    # Within the API limit and shaped like the existing call_ ids.
+    assert len(capped) <= 64
+    assert capped.startswith("call_")
+    # Deterministic: same original always maps to the same capped id (the
+    # pairing invariant depends on this).
+    assert _cap_call_id(_LONG_MCP_CALL_ID) == capped
+    # Idempotent: re-capping an already-capped (≤64) id is a no-op, so the
+    # receive-chokepoint cap and the request-build cap can't diverge.
+    assert _cap_call_id(capped) == capped
+
+
+def test_cap_call_id_passes_short_ids_through_unchanged():
+    # The common path (codex_exec_* ~31 chars, deterministic call_* ~17 chars,
+    # and any boundary id of exactly 64 chars) must be byte-for-byte unchanged
+    # so prompt-cache prefixes are preserved.
+    for short_id in (
+        "call_abc123",
+        "codex_exec_0123456789abcdef0123456789",
+        "x" * 64,
+    ):
+        assert _cap_call_id(short_id) == short_id
+
+    # Non-string inputs pass through unchanged (no crash).
+    assert _cap_call_id(None) is None  # type: ignore[arg-type]
+
+
+def test_cap_call_id_pairs_function_call_and_output_with_matching_ids():
+    """A function_call and its function_call_output, both built from the SAME
+    74-char backend id, must serialize to the SAME ≤64 call_id — otherwise the
+    Responses API rejects the request for a call_id mismatch."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": _LONG_MCP_CALL_ID,
+                    "call_id": _LONG_MCP_CALL_ID,
+                    "function": {
+                        "name": "slack_read_thread",
+                        "arguments": "{}",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": _LONG_MCP_CALL_ID,
+            "content": "thread contents",
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    function_calls = [it for it in items if it.get("type") == "function_call"]
+    function_outputs = [it for it in items if it.get("type") == "function_call_output"]
+    assert len(function_calls) == 1
+    assert len(function_outputs) == 1
+
+    fc_call_id = function_calls[0]["call_id"]
+    out_call_id = function_outputs[0]["call_id"]
+
+    # Both within the limit, and — critically — identical so the pair matches.
+    assert len(fc_call_id) <= 64
+    assert len(out_call_id) <= 64
+    assert fc_call_id == out_call_id == _cap_call_id(_LONG_MCP_CALL_ID)
 
 
 def test_normalize_codex_response_drops_transient_rs_tmp_reasoning_items():

@@ -790,13 +790,38 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        _codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        # DATA-LOSS FIX: the codex_app_server early-return bypasses the
+        # chat_completions loop, which is the ONLY place _persist_session()
+        # is called on its exit paths. Without this, an interactive codex
+        # turn never lands in the `messages` SQLite table — only the one-time
+        # session_meta row does (the journal hook in codex_runtime is lossy:
+        # no user text, no tool outputs). Persist here, mirroring the loop's
+        # normal exit (line ~4547: agent._persist_session(messages,
+        # conversation_history)).
+        #
+        # `messages` is the COMPLETE source: the user turn was appended above
+        # (line ~566) before this early-return, and _run_codex_app_server_turn
+        # extends it in place with the turn's projected assistant + tool
+        # messages. _persist_session dedups via _last_flushed_db_idx, so a
+        # re-entry (or the gateway's own skip_db pass) never double-writes.
+        # Fail-open: a persistence error must NOT break the codex turn — the
+        # turn result is already in hand, so we swallow and return it (mirrors
+        # the journal hook's fail-open in codex_runtime.run_codex_app_server_turn).
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "codex_app_server: _persist_session failed (turn unaffected)",
+                exc_info=True,
+            )
+        return _codex_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
