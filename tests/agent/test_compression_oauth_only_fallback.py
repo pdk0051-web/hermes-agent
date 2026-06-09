@@ -71,8 +71,14 @@ class TestCompressionNeverFallsToApiKeyProvider:
                     messages=[{"role": "user", "content": "summarize this"}],
                 )
 
-        # The original Codex backend was tried exactly once.
-        assert client.chat.completions.create.call_count == 1
+        # The original Codex OAuth backend is retried at most once on the SAME
+        # provider for a transient transport blip (5xx/timeout — upstream PR
+        # #16587's shared same-provider retry), but a terminal payment/credit
+        # error is tried exactly once.  Either way it stays on the OAuth
+        # backend — the headline guarantee below is that NO API-key provider is
+        # ever consulted for compression.
+        _expected_calls = 2 if isinstance(exc, _Timeout504) else 1
+        assert client.chat.completions.create.call_count == _expected_calls
         # No cross-provider fallback was attempted for compression.
         mock_pay.assert_not_called()
         mock_cfg.assert_not_called()
@@ -106,7 +112,10 @@ class TestCompressionNeverFallsToApiKeyProvider:
                     messages=[{"role": "user", "content": "summarize this"}],
                 )
 
-        assert client.chat.completions.create.await_count == 1
+        # Same-provider retry once on a transient blip (timeout); exactly once
+        # on a terminal payment error.  Never switches off the OAuth backend.
+        _expected_calls = 2 if isinstance(exc, _Timeout504) else 1
+        assert client.chat.completions.create.await_count == _expected_calls
         mock_pay.assert_not_called()
         mock_cfg.assert_not_called()
         mock_main.assert_not_called()

@@ -11,7 +11,17 @@
   ],
   "scripts": {
     "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
-    "agent-os:screenshot": "node scripts/agent_os_dashboard_screenshot.mjs"
+    "agent-os:screenshot": "node scripts/agent_os_dashboard_screenshot.mjs",
+    "install:root": "npm install --workspaces=false",
+    "install:web": "npm install --workspace web",
+    "install:tui": "npm install --workspace ui-tui",
+    "install:desktop": "npm install --workspace apps/desktop",
+    "audit:root": "npm audit --workspaces=false",
+    "audit:web": "npm audit --workspace web",
+    "audit:tui": "npm audit --workspace ui-tui",
+    "audit:fix:root": "npm audit fix --workspaces=false",
+    "audit:fix:web": "npm audit fix --workspace web",
+    "audit:fix:tui": "npm audit fix --workspace ui-tui"
   },
   "repository": {
     "type": "git",
