@@ -106,99 +106,82 @@ def run_codex_app_server_turn(
         _SEARCH = {"rg", "grep", "egrep", "fgrep", "ag", "ack"}
         _LIST = {"ls", "find", "fd", "tree", "exa", "eza", "stat", "du"}
 
-        # LEOS milestone labels bypass the generic-dev throttle (always emit).
-        _LEOS_LABELS = {
-            "법·헌법 확인", "계약 작업", "원장 기록", "통치·게이트",
-            "조약", "감사·검토", "LEOS 작업",
-        }
-
-        def _leos_phase(blob):
-            # LEOS-domain classification from any path / command / skill / mcp
-            # text on the item. Checked FIRST so domain work reads as itself.
+        def _domain_phase(item, text):
+            # DOMAIN classification delegated to plugins (de-fork Stage 6).
             #
-            # ROOT FIX: only classify as LEOS when the blob is actually in LEOS
-            # CONTEXT (a /leos/ path, a leos-* skill, or the Korean domain words
-            # 헌법/계약), THEN sub-classify. Generic "governance"/"gate"/"review"/
-            # "contract" tokens NO LONGER trigger LEOS labels on their own — that
-            # false-matched things like an `agent-os-governance` skill ("govern")
-            # or `gateway/*.py` reads. Returns (emoji, label) or None.
-            t = (blob or "").lower()
-            if not t:
-                return None
-            is_leos = (
-                "/leos/" in t
-                or "/users/leo/leos" in t
-                or "leos-constitution" in t
-                or "leos-contract" in t
-                or "leos-governor" in t
-                or "헌법" in (blob or "")
-                or "계약" in (blob or "")
-            )
-            if not is_leos:
-                # Not real LEOS context — let the generic dev classifier handle
-                # it. This is the key change.
-                return None
-            # LEOS context confirmed — sub-classify by keyword (now safe).
-            if (any(k in t for k in (
-                    "statutes", "bylaws", "decrees", "article-0", "constitution"))
-                    or "헌법" in (blob or "")
-                    or "leos-constitution" in t):
-                return ("⚖️", "법·헌법 확인")
-            if ("contracts" in t or "contract" in t
-                    or "계약" in (blob or "") or "leos-contract" in t):
-                return ("📜", "계약 작업")
-            if "ledger" in t:
-                return ("📒", "원장 기록")
-            if "governance" in t or "govern" in t or "gate" in t:
-                return ("🏛️", "통치·게이트")
-            if "treaties" in t:
-                return ("🤝", "조약")
-            if "reviews" in t:
-                return ("🔎", "감사·검토")
-            return ("🏛️", "LEOS 작업")
+            # The LEOS governance labels (⚖️ 법·헌법 확인 / 📜 계약 작업 /
+            # 📒 원장 기록 / 🏛️ 통치·게이트 / 🤝 조약 / 🔎 감사·검토 /
+            # 🏛️ LEOS 작업, with the /leos/-context gate) used to live inline
+            # here. They were LEOS doctrine, not generic dev tooling, so they
+            # were extracted into the out-of-tree leos-governor plugin and the
+            # core now fires the generic ``classify_codex_progress_phase`` hook
+            # instead. A plugin callback receives the raw ``item`` plus the
+            # already-dewrapped ``text`` (command / path / mcp blob / skill name)
+            # and may return a truthy ``(emoji, label)`` tuple to OVERRIDE the
+            # generic label below; the first truthy tuple wins.
+            #
+            # With NO plugin registered (the shipped default) ``invoke_hook``
+            # returns an empty list → ``None`` here → the generic dev classifier
+            # runs unchanged. Fully fail-open: importing the hook machinery is
+            # local (avoid an import cycle: codex_runtime ← agent ← plugins) and
+            # ANY error degrades to the generic label — a label miss must NEVER
+            # break a codex turn.
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                for _res in _invoke_hook(
+                    "classify_codex_progress_phase", item=item, text=text
+                ):
+                    if _res:
+                        return _res
+            except Exception:
+                pass
+            return None
 
         def _codex_phase(item):
-            # Map a codex item → (emoji, label). LEOS domain wins; otherwise a
-            # generic dev phase based on the item type / command verb.
+            # Map a codex item → (emoji, label, domain). A DOMAIN label from a
+            # plugin (via classify_codex_progress_phase) wins; otherwise a
+            # generic dev phase based on the item type / command verb. ``domain``
+            # is True only when a plugin produced the label — domain labels
+            # bypass the generic-dev throttle (they are milestones, not chatter).
             itype = item.get("type") or ""
             if itype == "commandExecution":
                 cmd = _dewrap_codex_command(item.get("command"))
-                leos = _leos_phase(cmd)
-                if leos:
-                    return leos
+                domain = _domain_phase(item, cmd)
+                if domain:
+                    return (domain[0], domain[1], True)
                 tokens = cmd.split()
                 base = tokens[0].rsplit("/", 1)[-1] if tokens else ""
                 low = cmd.lower()
                 if base in _READ or base in _SEARCH or base in _LIST:
-                    return ("📂", "코드 살펴보는 중")
+                    return ("📂", "코드 살펴보는 중", False)
                 if "pytest" in low or "run_tests" in low or base.startswith("test"):
-                    return ("🧪", "테스트")
+                    return ("🧪", "테스트", False)
                 if (base in ("npm", "vite", "webpack", "tsc", "yarn", "pnpm")
                         or "npm run build" in low):
-                    return ("🔨", "빌드")
+                    return ("🔨", "빌드", False)
                 if base == "git":
-                    return ("📦", "커밋·git")
-                return ("💻", "명령 실행")
+                    return ("📦", "커밋·git", False)
+                return ("💻", "명령 실행", False)
             if itype == "fileChange":
                 path = str(item.get("path") or item.get("changes")
                            or item.get("files") or "")
-                leos = _leos_phase(path)
-                if leos:
-                    return leos
-                return ("✏️", "코드 고치는 중")
+                domain = _domain_phase(item, path)
+                if domain:
+                    return (domain[0], domain[1], True)
+                return ("✏️", "코드 고치는 중", False)
             if itype == "mcpToolCall":
                 blob = (str(item.get("server") or "") + " "
                         + str(item.get("tool") or ""))
-                leos = _leos_phase(blob)
-                if leos:
-                    return leos
-                return ("🧰", "도구 사용")
+                domain = _domain_phase(item, blob)
+                if domain:
+                    return (domain[0], domain[1], True)
+                return ("🧰", "도구 사용", False)
             if itype == "dynamicToolCall":
                 name = str(item.get("name") or "")
-                leos = _leos_phase(name)
-                if leos:
-                    return leos
-                return ("🧰", "스킬 사용")
+                domain = _domain_phase(item, name)
+                if domain:
+                    return (domain[0], domain[1], True)
+                return ("🧰", "스킬 사용", False)
             # Unknown / non-tool item (e.g. reasoning) — no phase.
             return None
 
@@ -241,17 +224,17 @@ def run_codex_app_server_turn(
                 # Step counter advances on EVERY recognized item, even when the
                 # phase is unchanged / suppressed and no line is emitted.
                 agent._codex_step_count = getattr(agent, "_codex_step_count", 0) + 1
-                emoji, label = phase
+                emoji, label, is_domain = phase
                 # Meaningful unit: emit only when the activity SHIFTS.
                 changed = label != getattr(agent, "_codex_phase", None)
                 if not changed:
                     return
                 # Throttle generic dev phases to one line per ~30s (real work
-                # alternates 탐색↔명령↔테스트 fast → a wall of lines). LEOS
-                # milestones bypass the throttle and always show.
+                # alternates 탐색↔명령↔테스트 fast → a wall of lines). DOMAIN
+                # milestones (a plugin label, e.g. LEOS governance) bypass the
+                # throttle and always show.
                 now = time.time()
-                is_leos = label in _LEOS_LABELS
-                if is_leos:
+                if is_domain:
                     emit = True
                 else:
                     emit = (now - getattr(agent, "_codex_last_emit_ts", 0.0)) >= 30.0

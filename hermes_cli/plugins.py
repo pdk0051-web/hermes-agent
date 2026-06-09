@@ -178,6 +178,21 @@ VALID_HOOKS: Set[str] = {
     # Kwargs: session_id: str, gateway: GatewayRunner,
     #   is_resume_pending: bool, has_fresh_tool_tail: bool.
     "resolve_auto_continue",
+    # Codex progress-label classification hook (de-fork Stage 6). Fired by the
+    # codex_app_server progress bridge (``agent.codex_runtime._codex_phase``) for
+    # each codex work item BEFORE the generic dev-phase classifier runs. Lets a
+    # plugin map an item to a DOMAIN-SPECIFIC progress label (e.g. the
+    # leos-governor Korean governance labels: ⚖️ 법·헌법 확인 / 📜 계약 작업 /
+    # 📒 원장 기록 / 🏛️ 통치·게이트 …). A plugin returns a truthy
+    # ``(emoji, label)`` tuple to OVERRIDE the generic label; the first truthy
+    # tuple wins. With no plugin registered (the shipped default) ``invoke_hook``
+    # returns an empty list and the core falls through to its STOCK generic
+    # classifier (📂 코드 살펴보는 중 / 🧪 테스트 / 🔨 빌드 …) — so a stock
+    # Hermes is byte-for-byte the original generic behaviour. Purely cosmetic
+    # (a progress-bubble label); fail-open: any error → generic label.
+    # Kwargs: item: dict (the raw codex item), text: str (the dewrapped
+    #   command / path / mcp blob / skill name used to classify that item).
+    "classify_codex_progress_phase",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
