@@ -5329,6 +5329,17 @@ def call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
         )
+        # Context compression is OAuth-only by policy: when the OAuth Codex
+        # backend fails, it must NEVER silently fall through to an API-key
+        # provider (OpenRouter / Nous).  The compressor (context_compressor.py)
+        # owns the recovery policy for this task — retry with an escalated
+        # timeout, notify the operator, then a deterministic static-summary
+        # fallback — so suppress the cross-provider fallback chain entirely and
+        # re-raise to the compressor.  This guard is scoped to compression only;
+        # every other auxiliary task (vision, web_extract, …) keeps its existing
+        # payment/connection fallback behaviour.
+        if task == "compression":
+            should_fallback = False
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
         # serve the request due to capacity: payment/quota exhaustion and
@@ -5762,6 +5773,12 @@ async def async_call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
         )
+        # Context compression is OAuth-only: never fall through to an API-key
+        # provider (OpenRouter / Nous) when the OAuth Codex backend fails.  The
+        # compressor owns retry/notify/static-fallback for this task.  Mirrors
+        # the guard in the sync call_llm above; scoped to compression only.
+        if task == "compression":
+            should_fallback = False
         # Capacity errors (payment/quota/connection) bypass the explicit-provider
         # gate — the provider cannot serve the request regardless of user intent.
         # See #26803: daily token quota must fall back like a 402 credit error.

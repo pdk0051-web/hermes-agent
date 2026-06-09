@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error
+from agent.auxiliary_client import call_llm, _is_connection_error, _is_payment_error
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -104,6 +104,27 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+# Transient-failure retry policy for the OAuth compression model (#LEO).
+# Context compression must stay OAuth-only — it never falls through to an
+# API-key backend (see the ``task == "compression"`` guard in
+# auxiliary_client.call_llm).  So when the OAuth Codex backend hits a *transient*
+# failure (request timeout, 5xx, dropped stream) we retry in-process with an
+# escalated request timeout before resorting to the deterministic static
+# summary.  Payment / credit-exhaustion errors are NOT transient (the same
+# request will fail again) and skip straight to the static fallback.
+#   _SUMMARY_TRANSIENT_MAX_RETRIES: how many extra attempts after the first.
+#   _SUMMARY_TRANSIENT_TIMEOUT_MULTIPLIER: each retry multiplies the configured
+#       auxiliary.compression.timeout by this factor (240s → 480s) to give a
+#       slow-but-alive backend room to finish.
+#   _SUMMARY_TIMEOUT_CEILING_SECONDS: never escalate the per-attempt timeout
+#       past this hard ceiling.
+_SUMMARY_TRANSIENT_MAX_RETRIES = 1
+_SUMMARY_TRANSIENT_TIMEOUT_MULTIPLIER = 2.0
+_SUMMARY_TIMEOUT_CEILING_SECONDS = 600.0
+# Default per-attempt timeout used to seed the escalation when call_llm would
+# otherwise read it from config.  Mirrors auxiliary.compression.timeout (240).
+_SUMMARY_DEFAULT_TIMEOUT_SECONDS = 240.0
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -563,6 +584,8 @@ class ContextCompressor(ContextEngine):
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_summary_retry_count = 0
+        self._last_summary_retry_error = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
@@ -698,6 +721,15 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        # OAuth-only transient-retry bookkeeping (#LEO).  When the OAuth
+        # compression backend hits a transient failure we retry in-process
+        # with an escalated timeout (never falling through to an API-key
+        # provider).  These let the gateway/CLI notify the operator that
+        # compression failed transiently and is being retried, and — if every
+        # retry was exhausted — that it fell back to a deterministic static
+        # summary.  Reset at the start of each compress() pass.
+        self._last_summary_retry_count: int = 0
+        self._last_summary_retry_error: Optional[str] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1232,10 +1264,24 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
+    def _escalated_summary_timeout(self, retry_count: int) -> float:
+        """Per-attempt request timeout for a transient-failure retry.
+
+        Grows the base compression timeout geometrically with each retry so a
+        slow-but-alive OAuth backend gets more room, capped at
+        ``_SUMMARY_TIMEOUT_CEILING_SECONDS``.  ``retry_count`` is 1 for the
+        first retry, 2 for the second, etc.
+        """
+        escalated = _SUMMARY_DEFAULT_TIMEOUT_SECONDS * (
+            _SUMMARY_TRANSIENT_TIMEOUT_MULTIPLIER ** max(1, retry_count)
+        )
+        return min(escalated, _SUMMARY_TIMEOUT_CEILING_SECONDS)
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        _retry_count: int = 0,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1249,6 +1295,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 provided, the summariser prioritises preserving information
                 related to this topic and is more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
+            _retry_count: Internal — number of transient-failure retries already
+                attempted in this compaction.  The OAuth compression backend is
+                never allowed to fall through to an API-key provider, so on a
+                transient failure (timeout / 5xx / dropped stream) we retry here
+                with an escalated request timeout up to
+                ``_SUMMARY_TRANSIENT_MAX_RETRIES`` before giving up to the
+                static fallback.  Payment/credit errors are not transient and do
+                not retry.
 
         Returns None if all attempts fail — the caller should drop
         the middle turns without a summary rather than inject a useless
@@ -1410,6 +1464,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
+            # On a transient-failure retry, escalate the request timeout so a
+            # slow-but-alive OAuth backend gets room to finish instead of timing
+            # out again.  call_llm reads auxiliary.compression.timeout when no
+            # explicit timeout is passed; we seed from that default and grow it.
+            if _retry_count > 0:
+                call_kwargs["timeout"] = self._escalated_summary_timeout(_retry_count)
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
@@ -1514,6 +1574,49 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             ):
                 self._fallback_to_main_for_compression(e, "failed")
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+
+            # ── OAuth-only transient retry (#LEO) ─────────────────────────
+            # Compression is pinned to the OAuth backend and must never fall
+            # through to an API-key provider.  When we reach here the
+            # aux-model→main fallback did not apply (summary_model is the main
+            # model, or we already fell back), so a transient failure would
+            # otherwise drop straight to the static summary.  Instead retry
+            # in-process with an escalated request timeout, giving a
+            # slow-but-alive backend room to finish.
+            #
+            # Only TRANSIENT failures retry: request timeouts (incl. 408/429/
+            # 502/504), dropped/streaming-closed connections.  Payment / credit
+            # exhaustion (402, "insufficient credits") is NOT transient — the
+            # same request fails again — so it skips the retry and goes straight
+            # to the static fallback below.  Model-not-found / JSON-decode are
+            # config/proxy problems, not slow-backend problems, and also do not
+            # benefit from a longer timeout, so they fall through too.
+            _is_payment = _is_payment_error(e)
+            _is_retryable_transient = (
+                (_is_timeout or _is_streaming_closed) and not _is_payment
+            )
+            if _is_retryable_transient and _retry_count < _SUMMARY_TRANSIENT_MAX_RETRIES:
+                _next_retry = _retry_count + 1
+                _retry_err_text = str(e).strip() or e.__class__.__name__
+                if len(_retry_err_text) > 220:
+                    _retry_err_text = _retry_err_text[:217].rstrip() + "..."
+                # Record retry bookkeeping so the gateway/CLI can notify the
+                # operator that compression failed transiently and is retrying.
+                self._last_summary_retry_count = _next_retry
+                self._last_summary_retry_error = _retry_err_text
+                self._summary_failure_cooldown_until = 0.0  # retry now, no cooldown
+                logger.warning(
+                    "Context compression: transient failure on OAuth backend "
+                    "(%s) — retry %d/%d with escalated timeout %.0fs. "
+                    "(API-key fallback is disabled for compression.)",
+                    e, _next_retry, _SUMMARY_TRANSIENT_MAX_RETRIES,
+                    self._escalated_summary_timeout(_next_retry),
+                )
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    _retry_count=_next_retry,
+                )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and
@@ -1945,6 +2048,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._last_summary_retry_count = 0
+        self._last_summary_retry_error = None
         self._last_compress_aborted = False
 
         # Manual /compress (force=True) bypasses the failure cooldown so the

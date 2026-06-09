@@ -61,6 +61,85 @@ def _compression_lock_holder(agent: Any) -> str:
     )
 
 
+def _emit_compression_failure_notices(agent: Any) -> None:
+    """Surface compression summary failures / OAuth retries to the operator.
+
+    Context compression is OAuth-only — when the OAuth backend fails it never
+    falls through to an API-key provider.  The compressor instead retries with
+    an escalated timeout and, if those are exhausted, inserts a deterministic
+    static summary.  This reads the compressor's per-pass failure bookkeeping
+    and emits a single (deduped) user-facing notice for whichever outcome
+    occurred:
+
+      * Hard failure (static summary inserted): ``_last_summary_error`` set.
+        If transient retries were attempted first, the notice says so.
+      * Recovered after a transient retry: ``_last_summary_retry_count > 0``
+        with no ``_last_summary_error`` — compression briefly failed but
+        self-healed without a static summary.
+      * Misconfigured ``auxiliary.compression.model`` recovered on the main
+        model: ``_last_aux_model_failure_model`` set.
+
+    All notices route through ``agent._emit_warning`` (CLI + Slack/Discord;
+    suppressed as transient noise on Telegram by the gateway noise filter).
+    Dedup keys on ``agent`` prevent spamming the same notice on every
+    compaction.  Notices are emitted via ``_emit_warning`` which never raises.
+    """
+    compressor = agent.context_compressor
+    summary_error = getattr(compressor, "_last_summary_error", None)
+    # Number of in-process transient retries the OAuth compression backend made
+    # this pass (timeout / 5xx / dropped stream).
+    _retry_count = int(getattr(compressor, "_last_summary_retry_count", 0) or 0)
+    _retry_err = getattr(compressor, "_last_summary_retry_error", None)
+    if summary_error:
+        # Hard failure → a deterministic static summary was inserted.  Dedup on
+        # the error text so repeated compactions don't spam the same warning.
+        if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
+            agent._last_compression_summary_warning = summary_error
+            if _retry_count > 0:
+                # Failed transiently, retried (OAuth-only — no API-key
+                # fallback), still failed → static summary.  One concise line.
+                agent._emit_warning(
+                    f"⚠️ 압축 실패: {summary_error}. "
+                    f"재시도 {_retry_count}회 후에도 실패하여 정적 요약으로 진행합니다 "
+                    "(OAuth 유지, API-key 폴백 없음)."
+                )
+            else:
+                agent._emit_warning(
+                    f"⚠️ 압축 실패: {summary_error}. 정적 요약으로 진행합니다."
+                )
+        return
+
+    # No hard failure.  Two non-exclusive informational cases:
+    #   (a) a transient OAuth failure that recovered on retry, and
+    #   (b) a misconfigured auxiliary.compression.model that recovered on the
+    #       main model.
+    if _retry_count > 0:
+        # Recovered after a transient retry — let the operator know compression
+        # briefly failed but self-healed without dropping to a static summary.
+        _retry_key = ("recovered", _retry_count, _retry_err)
+        if getattr(agent, "_last_compression_retry_warning_key", None) != _retry_key:
+            agent._last_compression_retry_warning_key = _retry_key
+            agent._emit_warning(
+                f"ℹ️ 압축이 일시 실패({_retry_err or 'transient error'})했으나 "
+                f"재시도 {_retry_count}회로 복구했습니다 (정적 요약 미사용)."
+            )
+    # (b) did the configured aux model error out and get recovered by retrying
+    # on main?  Surface that so users know their auxiliary.compression.model
+    # setting is broken even though compression succeeded.
+    _aux_fail_model = getattr(compressor, "_last_aux_model_failure_model", None)
+    _aux_fail_err = getattr(compressor, "_last_aux_model_failure_error", None)
+    if _aux_fail_model:
+        # Dedup on (model, error) so we don't spam on every compaction
+        _aux_key = (_aux_fail_model, _aux_fail_err)
+        if getattr(agent, "_last_aux_fallback_warning_key", None) != _aux_key:
+            agent._last_aux_fallback_warning_key = _aux_key
+            agent._emit_warning(
+                f"ℹ Configured compression model '{_aux_fail_model}' failed "
+                f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
+                "check auxiliary.compression.model in config.yaml."
+            )
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -464,31 +543,9 @@ def compress_context(
         _release_lock()  # compression aborted — no rotation will happen
         return messages, _existing_sp
 
-    summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
-    if summary_error:
-        if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
-            agent._last_compression_summary_warning = summary_error
-            agent._emit_warning(
-                f"⚠ Compression summary failed: {summary_error}. "
-                "Inserted a fallback context marker."
-            )
-    else:
-        # No hard failure — but did the configured aux model error out
-        # and get recovered by retrying on main?  Surface that so users
-        # know their auxiliary.compression.model setting is broken even
-        # though compression succeeded.
-        _aux_fail_model = getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
-        _aux_fail_err = getattr(agent.context_compressor, "_last_aux_model_failure_error", None)
-        if _aux_fail_model:
-            # Dedup on (model, error) so we don't spam on every compaction
-            _aux_key = (_aux_fail_model, _aux_fail_err)
-            if getattr(agent, "_last_aux_fallback_warning_key", None) != _aux_key:
-                agent._last_aux_fallback_warning_key = _aux_key
-                agent._emit_warning(
-                    f"ℹ Configured compression model '{_aux_fail_model}' failed "
-                    f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
-                    "check auxiliary.compression.model in config.yaml."
-                )
+    # Surface compression summary failures / OAuth-only transient retries to
+    # the operator (deduped, routed through _emit_warning).
+    _emit_compression_failure_notices(agent)
 
     todo_snapshot = agent._todo_store.format_for_injection()
     if todo_snapshot:

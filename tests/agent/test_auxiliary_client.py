@@ -3551,7 +3551,14 @@ class TestAuxUnhealthyCache:
     def test_call_llm_marks_provider_unhealthy_on_402(self, monkeypatch):
         """A 402 from call_llm causes the provider to be marked unhealthy
         so the next call skips it instead of re-trying the same depleted
-        endpoint."""
+        endpoint.
+
+        Uses ``task="web_extract"`` (not compression): compression is OAuth-only
+        and the ``task == "compression"`` guard now suppresses the cross-provider
+        payment fallback entirely, so it would neither call _try_payment_fallback
+        nor mark the provider unhealthy.  This unhealthy-marking behaviour still
+        applies to every other auxiliary task.
+        """
         from agent.auxiliary_client import (
             call_llm,
             _is_provider_unhealthy,
@@ -3581,7 +3588,7 @@ class TestAuxUnhealthyCache:
                     return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
             assert _is_provider_unhealthy("openrouter") is False
             call_llm(
-                task="compression",
+                task="web_extract",
                 messages=[{"role": "user", "content": "hi"}],
             )
             # After the 402, OpenRouter is in the unhealthy cache.

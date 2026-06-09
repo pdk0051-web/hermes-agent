@@ -73,6 +73,11 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
+    # Korean compression-failure status (context_compressor OAuth retry / static
+    # fallback notifications) — keep this transient chatter in logs + Slack/CLI
+    # but out of Telegram chat, same policy as the English variants above.
+    r"|압축\s*실패"
+    r"|압축이\s*일시\s*실패"
     r"|configured\s+compression\s+model\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
