@@ -111,6 +111,24 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
 
+# Last-resort window-fit safety net (see ``_enforce_context_window_fit``).  When
+# a single oversized tool result lands where token-budget tail protection keeps
+# it verbatim, summarizing the middle does not bring the transcript under the
+# model window, and the NEXT main API call fails with "input exceeds the context
+# window".  These bound the emergency trim applied only in that case.
+#   _WINDOW_FIT_MARGIN_TOKENS: headroom reserved below context_length for the
+#       upcoming user turn + provider token-count drift AND the system prompt +
+#       tool schemas that the message-token estimate does NOT count (~23K in this
+#       codex / 82-tool setup). The real request is messages + system + tools, so
+#       trimming messages to context_length - 8K alone still overflowed in the
+#       worst case (recent context near the ceiling + one huge tool result).
+#       Trim to a target that leaves room for that out-of-band overhead too.
+#   _WINDOW_FIT_TOOL_KEEP_CHARS: when an oversized tool result must be trimmed,
+#       keep this many chars (head + tail) so the agent retains a usable anchor
+#       instead of losing the output entirely.
+_WINDOW_FIT_MARGIN_TOKENS = 32_000  # ~8K turn/drift + ~24K system+tool schema overhead
+_WINDOW_FIT_TOOL_KEEP_CHARS = 4_000
+
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 
@@ -1821,6 +1839,80 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
+    # Last-resort window-fit safety net
+    # ------------------------------------------------------------------
+
+    def _enforce_context_window_fit(
+        self, compressed: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Guarantee the compressed transcript fits within the model window.
+
+        Summarization collapses only the middle region; the protected head and
+        the token-budget tail are kept verbatim.  When a single oversized tool
+        result lands in that verbatim tail (e.g. a ~285K-token file dump as the
+        most recent output), summarizing the small middle does not bring the
+        transcript under ``context_length`` — so the next main API call fails
+        with "input exceeds the context window" (live incident 2026-06-09).
+
+        This is a strictly additive last resort: when the estimate is already
+        within the window (the overwhelmingly common case) it is a no-op and the
+        list is returned unchanged.  Only when the transcript still exceeds the
+        window does it trim oversized ``tool`` result contents to a head+tail
+        anchor, oldest-first, stopping as soon as the transcript fits.  User and
+        assistant messages are never modified and no message is dropped.
+
+        The most-recent tool result is trimmed last, so it is preserved in full
+        whenever trimming older tool output is enough to fit the window.
+        """
+        target = max(self.context_length - _WINDOW_FIT_MARGIN_TOKENS, MINIMUM_CONTEXT_LENGTH)
+        total = estimate_messages_tokens_rough(compressed)
+        if total <= target:
+            return compressed
+
+        # Indices of oversized tool results, oldest-first.  Only string tool
+        # contents are trimmable here (multimodal/dict shapes are handled
+        # upstream by _strip_historical_media / image stripping).
+        tool_indices = [
+            i
+            for i, m in enumerate(compressed)
+            if m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and len(m["content"]) > _WINDOW_FIT_TOOL_KEEP_CHARS
+        ]
+        if not tool_indices:
+            return compressed
+
+        trimmed_any = False
+        head = _WINDOW_FIT_TOOL_KEEP_CHARS * 3 // 4
+        tail = _WINDOW_FIT_TOOL_KEEP_CHARS - head
+        for idx in tool_indices:
+            if total <= target:
+                break
+            msg = compressed[idx]
+            original = msg["content"]
+            before_chars = len(original)
+            new_content = (
+                original[:head]
+                + "\n...[oversized tool output trimmed to fit the context window]...\n"
+                + original[-tail:]
+            )
+            compressed[idx] = {**msg, "content": new_content}
+            trimmed_any = True
+            # Update the running estimate by the chars removed (~4 chars/token)
+            # instead of recomputing the whole list each iteration.
+            total -= (before_chars - len(new_content)) // _CHARS_PER_TOKEN
+
+        if trimmed_any and not self.quiet_mode:
+            logger.warning(
+                "Context still exceeded the model window after summarization; "
+                "trimmed oversized tool output to fit (target ~%d tokens, "
+                "context_length=%d).",
+                target,
+                self.context_length,
+            )
+        return compressed
+
+    # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
 
@@ -2053,6 +2145,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # past the provider's body-size limit and wedge the session.
         # Port of Kilo-Org/kilocode#9434.
         compressed = _strip_historical_media(compressed)
+
+        # Last resort: if the summarized transcript still exceeds the model
+        # window (an oversized tool result kept verbatim in the protected tail),
+        # trim that tool output so the NEXT main API call does not fail with
+        # "input exceeds the context window".  No-op when already within window.
+        compressed = self._enforce_context_window_fit(compressed)
 
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate
