@@ -26,6 +26,7 @@ import {
   Database,
   Download,
   Eye,
+  FolderOpen,
   FileText,
   Globe,
   Heart,
@@ -69,12 +70,14 @@ import type { SystemAction } from "@/contexts/system-actions-context";
 import ConfigPage from "@/pages/ConfigPage";
 import DocsPage from "@/pages/DocsPage";
 import EnvPage from "@/pages/EnvPage";
+import FilesPage from "@/pages/FilesPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
+import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import McpPage from "@/pages/McpPage";
@@ -127,6 +130,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/agent-os": AgentOsPage,
+  "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
   "/logs": LogsPage,
@@ -139,6 +143,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
   "/profiles": ProfilesPage,
+  "/profiles/new": ProfileBuilderPage,
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
@@ -159,6 +164,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
+  { path: "/files", label: "Files", icon: FolderOpen },
   {
     path: "/agent-os",
     label: "Agent OS",
@@ -202,6 +208,7 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Clock,
   Cpu,
   FileText,
+  FolderOpen,
   KeyRound,
   MessageSquare,
   Orbit,
