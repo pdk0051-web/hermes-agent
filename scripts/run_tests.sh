@@ -48,6 +48,15 @@ fi
 
 PYTHON="$VENV/bin/python"
 
+# macOS shells often start with a soft nofile limit of 256. The parallel
+# runner fans out many isolated pytest subprocesses, and aiohttp-heavy files
+# can exhaust that cap before the suite finishes. Raise the soft limit when
+# possible; ignore hosts that disallow it.
+FD_LIMIT="$(ulimit -n 2>/dev/null || echo 0)"
+if [[ "$FD_LIMIT" =~ ^[0-9]+$ ]] && [ "$FD_LIMIT" -lt 1024 ]; then
+  ulimit -n 1024 2>/dev/null || true
+fi
+
 
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""

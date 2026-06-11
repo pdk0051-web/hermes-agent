@@ -46,6 +46,18 @@ from agent.models_dev import (
 logger = logging.getLogger(__name__)
 
 
+def _is_ollama_placeholder_key(api_key: str, api_url: str) -> bool:
+    """Return True for the conventional local Ollama OpenAI-compatible key."""
+    if api_key.strip().lower() != "ollama":
+        return False
+    url = api_url.strip().lower()
+    return (
+        "localhost:11434" in url
+        or "127.0.0.1:11434" in url
+        or "0.0.0.0:11434" in url
+    )
+
+
 # ---------------------------------------------------------------------------
 # Non-agentic model warning
 # ---------------------------------------------------------------------------
@@ -1720,7 +1732,12 @@ def list_authenticated_providers(
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
-            if api_url and api_key and discover:
+            if (
+                api_url
+                and api_key
+                and discover
+                and not _is_ollama_placeholder_key(api_key, api_url)
+            ):
                 try:
                     from hermes_cli.models import fetch_api_models
                     live_models = fetch_api_models(api_key, api_url)
@@ -1926,7 +1943,10 @@ def list_authenticated_providers(
             #   (parity with section 3's user ``providers:`` behaviour).
             should_probe = (
                 bool(api_url)
-                and (bool(api_key) or not grp["models"])
+                and (
+                    (bool(api_key) and not _is_ollama_placeholder_key(api_key, api_url))
+                    or not grp["models"]
+                )
                 and grp.get("discover_models", True)
             )
             if should_probe:
