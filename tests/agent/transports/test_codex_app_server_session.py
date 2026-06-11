@@ -51,10 +51,10 @@ class FakeClient:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
         if method == "thread/start":
-            return {"thread": {"id": "thread-fake-001"},
+            return {"thread": {"id": "t"},
                     "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
-            return {"turn": {"id": "turn-fake-001"}}
+            return {"turn": {"id": "tu1"}}
         if method == "turn/interrupt":
             return {}
         return {}
@@ -144,7 +144,7 @@ class TestLifecycle:
         s = make_session(client)
         tid_a = s.ensure_started()
         tid_b = s.ensure_started()
-        assert tid_a == tid_b == "thread-fake-001"
+        assert tid_a == tid_b == "t"
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
@@ -194,14 +194,14 @@ class TestRunTurn:
         assert any(m["role"] == "assistant" and m.get("content") == "hello world"
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
-        assert r.turn_id == "turn-fake-001"
+        assert r.turn_id == "tu1"
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
         client.queue_notification(
             "thread/tokenUsage/updated",
-            threadId="thread-fake-001",
-            turnId="turn-fake-001",
+            threadId="t",
+            turnId="tu1",
             tokenUsage={
                 "last": {
                     "totalTokens": 130,
@@ -404,7 +404,7 @@ class TestRunTurn:
         assert r.interrupted is True
         # turn/interrupt was requested with the right turnId
         assert any(
-            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
+            method == "turn/interrupt" and params.get("turnId") == "tu1"
             for (method, params) in client.requests
         )
 
@@ -974,7 +974,7 @@ class TestThreadStartCrossFill:
         client = FakeClient()
         s = make_session(client)
         tid = s.ensure_started()
-        assert tid == "thread-fake-001"
+        assert tid == "t"
 
     def test_thread_session_id_alias_under_thread_key(self):
         client = FakeClient()
@@ -1093,3 +1093,126 @@ class TestClassifyOAuthFailure:
             "[stderr] token has expired, run codex login",
         )
         assert hint is not None
+
+
+# ---- multi-agent notification isolation (2026-06-11 incident) ----
+
+class TestForeignNotificationIsolation:
+    """Subagent (multi-agent codex) events multiplexed on the parent
+    connection must not complete the parent turn or contaminate its
+    projection. Regression for the 2026-06-11 incident where a subagent's
+    turn/completed shipped the subagent's text as the parent's final
+    response and orphaned the parent task's real conclusion."""
+
+    def test_foreign_turn_completed_does_not_end_parent_turn(self):
+        client = FakeClient()
+        # Subagent finishes first: its message and turn/completed arrive
+        # before the parent's real final message.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "sub-m1",
+                  "text": "SUBAGENT INTERMEDIATE"},
+            threadId="sub-thread", turnId="sub-turn",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="sub-thread",
+            turn={"id": "sub-turn", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "REAL FINAL"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=2.0)
+        assert r.final_text == "REAL FINAL"
+        assert r.interrupted is False
+        assert r.error is None
+        # The subagent's text must not enter the parent's projection.
+        assert not any(
+            m.get("content") == "SUBAGENT INTERMEDIATE"
+            for m in r.projected_messages
+        )
+
+    def test_foreign_turn_id_same_thread_ignored(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "other-turn", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "ours"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+        assert r.final_text == "ours"
+        assert r.error is None
+
+    def test_unstamped_notifications_keep_legacy_behaviour(self):
+        # Older codex builds may omit threadId/turnId — those events must
+        # behave exactly as before (treated as ours).
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "legacy final"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            turn={"status": "completed", "error": None},
+        )
+        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+        assert r.final_text == "legacy final"
+        assert r.error is None
+
+    def test_foreign_traffic_clears_post_tool_quiet_watchdog(self):
+        # A parent silently awaiting subagents is not wedged: foreign
+        # events must clear the quiet timer instead of letting it fire.
+        client = FakeClient()
+        # Parent tool completion arms the watchdog...
+        client.queue_notification(
+            "item/completed",
+            item={"type": "commandExecution", "id": "ex1", "command": "spawn",
+                  "cwd": "/tmp", "status": "completed",
+                  "aggregatedOutput": "ok", "exitCode": 0,
+                  "commandActions": []},
+            threadId="t", turnId="tu1",
+        )
+        # ...then only foreign traffic arrives for a while...
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "sub-m", "text": "sub working"},
+            threadId="sub-thread", turnId="sub-turn",
+        )
+        # ...and finally the parent completes normally.
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "parent done"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        # Tight quiet timeout: if foreign traffic failed to clear the
+        # watchdog, this run would be interrupted with a quiet-timeout
+        # error instead of completing.
+        r = make_session(client).run_turn(
+            "hi", turn_timeout=2.0, post_tool_quiet_timeout=10.0
+        )
+        assert r.final_text == "parent done"
+        assert r.interrupted is False
+        assert r.error is None

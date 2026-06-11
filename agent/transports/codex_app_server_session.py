@@ -443,6 +443,28 @@ class CodexAppServerSession:
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
+
+        def _is_foreign_notification(note_params: dict) -> bool:
+            """True when a notification is stamped for another thread/turn.
+
+            Multi-agent codex multiplexes subagent thread/turn events over
+            the parent's connection. A foreign-stamped event must not
+            contaminate THIS turn's projection or — above all — complete
+            the turn: observed 2026-06-11, a subagent's turn/completed
+            ended the parent turn, shipping the subagent's text as the
+            final response and orphaning the parent task's real conclusion
+            (codex task_complete arrived 4.5 min later with no reader).
+            Events without id stamps (older codex builds) are treated as
+            ours so single-agent behaviour is byte-for-byte unchanged.
+            """
+            nthread = note_params.get("threadId")
+            if nthread and self._thread_id and nthread != self._thread_id:
+                return True
+            nturn = note_params.get("turnId") or (
+                (note_params.get("turn") or {}).get("id")
+            )
+            return bool(nturn and result.turn_id and nturn != result.turn_id)
+
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
@@ -504,6 +526,11 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
+                    if _is_foreign_notification(pending.get("params") or {}):
+                        # Approval context may reference subagent items, so
+                        # keep tracking file changes; skip everything else.
+                        self._track_pending_file_change(pending)
+                        continue
                     _apply_token_usage_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
@@ -539,6 +566,22 @@ class CodexAppServerSession:
                     self._on_event(note)
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
+
+            if _is_foreign_notification(note.get("params") or {}):
+                # Subagent traffic: keep approval context and treat it as
+                # proof the subprocess is alive (clear the quiet watchdog —
+                # a parent silently awaiting subagents is not wedged), but
+                # never let it project messages, count tokens, or complete
+                # this turn.
+                self._track_pending_file_change(note)
+                last_tool_completion_at = None
+                if method == "turn/completed":
+                    logger.debug(
+                        "Ignoring foreign turn/completed (theirs=%s ours=%s)",
+                        ((note.get("params") or {}).get("turn") or {}).get("id"),
+                        result.turn_id,
+                    )
+                continue
 
             _apply_token_usage_notification(result, note)
 
