@@ -22,9 +22,32 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+# ── Collection-time HERMES_HOME isolation ───────────────────────────────────
+# The autouse ``_hermetic_environment`` fixture below redirects HERMES_HOME
+# per test, but fixtures run AFTER module import: a module that resolves
+# ``get_hermes_home()`` at import time (log handlers, crash-log paths,
+# auth-store constants) captures the env as it stood during collection.
+# When that env points at the real ``~/.hermes``, test log records and
+# auth-store writes land in production files (observed 2026-06-11: pytest
+# WARNING/ERROR noise in the live gateway's errors.log/agent.log).
+# Pin HERMES_HOME (and CODEX_HOME) to a session tempdir before anything
+# from the package is imported, so collection-time resolution can never
+# see the real home. The per-test fixture still overrides per test.
+_REAL_HERMES_HOME = (Path.home() / ".hermes").resolve()
+_env_home = os.environ.get("HERMES_HOME", "").strip()
+if not _env_home or Path(_env_home).expanduser().resolve() == _REAL_HERMES_HOME:
+    _SESSION_HOME = Path(tempfile.mkdtemp(prefix="hermes-test-session-home-"))
+    for _sub in ("logs", "sessions", "cron", "memories", "skills"):
+        (_SESSION_HOME / _sub).mkdir(parents=True, exist_ok=True)
+    os.environ["HERMES_HOME"] = str(_SESSION_HOME)
+if not os.environ.get("CODEX_HOME", "").strip():
+    _SESSION_CODEX = Path(tempfile.mkdtemp(prefix="hermes-test-session-codex-"))
+    os.environ["CODEX_HOME"] = str(_SESSION_CODEX)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
