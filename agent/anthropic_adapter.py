@@ -893,7 +893,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -925,12 +925,13 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
-    # Try macOS Keychain first (covers Claude Code >=2.1.114)
+    # Claude Code moved OAuth credentials to the macOS Keychain in newer
+    # releases; when both stores exist, Keychain is the fresher source.
     kc_creds = _read_claude_code_credentials_from_keychain()
     if kc_creds:
         return kc_creds
 
-    # Fall back to JSON file
+    # Fall back to the legacy JSON file used by older Claude Code installs.
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if cred_path.exists():
         try:
